@@ -5,6 +5,7 @@ use crate::{
 use std::{
     path::Path,
     sync::{Arc, Mutex},
+    collections::HashSet,
 };
 use tokio::sync::broadcast;
 use tokio_stream::{Stream};
@@ -68,16 +69,16 @@ pub struct WorkflowRecorderConfig {
     pub min_drag_distance: f64,
     
     /// Patterns to ignore for UI focus change events (case-insensitive)
-    pub ignore_focus_patterns: Vec<String>,
+    pub ignore_focus_patterns: HashSet<String>,
     
     /// Patterns to ignore for UI property change events (case-insensitive)
-    pub ignore_property_patterns: Vec<String>,
+    pub ignore_property_patterns: HashSet<String>,
     
     /// Window titles to ignore for UI events (case-insensitive)
-    pub ignore_window_titles: Vec<String>,
+    pub ignore_window_titles: HashSet<String>,
     
     /// Application/process names to ignore for UI events (case-insensitive)
-    pub ignore_applications: Vec<String>,
+    pub ignore_applications: HashSet<String>,
 }
 
 impl Default for WorkflowRecorderConfig {
@@ -99,7 +100,7 @@ impl Default for WorkflowRecorderConfig {
             track_modifier_states: true,
             mouse_move_throttle_ms: 50, // 20 FPS max for mouse moves
             min_drag_distance: 5.0, // 5 pixels minimum for drag detection
-            ignore_focus_patterns: vec![
+            ignore_focus_patterns: [
                 // Common system UI patterns to ignore by default
                 "notification".to_string(),
                 "tooltip".to_string(),
@@ -111,6 +112,14 @@ impl Default for WorkflowRecorderConfig {
                 "screen share".to_string(),
                 "is sharing".to_string(),
                 "screen recording".to_string(),
+                "presenting".to_string(), // For Google Meet, etc.
+                "google meet".to_string(),
+                "zoom".to_string(),
+                "loom".to_string(),
+                "1password".to_string(),
+                "lastpass".to_string(),
+                "dashlane".to_string(),
+                "bitwarden".to_string(),
                 // Common background noise patterns
                 "battery".to_string(),
                 "volume".to_string(),
@@ -130,8 +139,8 @@ impl Default for WorkflowRecorderConfig {
                 "security".to_string(),
                 "system tray".to_string(),
                 "hidden icons".to_string(),
-            ],
-            ignore_property_patterns: vec![
+            ].into_iter().collect(),
+            ignore_property_patterns: [
                 // Common property change patterns to ignore by default
                 "clock".to_string(),
                 "time".to_string(),
@@ -139,6 +148,14 @@ impl Default for WorkflowRecorderConfig {
                 "sharing".to_string(),
                 "recording".to_string(),
                 "capture".to_string(),
+                "presenting".to_string(), // For Google Meet, etc.
+                "google meet".to_string(),
+                "zoom".to_string(),
+                "loom".to_string(),
+                "1password".to_string(),
+                "lastpass".to_string(),
+                "dashlane".to_string(),
+                "bitwarden".to_string(),
                 // System status and background updates
                 "battery".to_string(),
                 "volume".to_string(),
@@ -158,11 +175,27 @@ impl Default for WorkflowRecorderConfig {
                 "sync".to_string(),
                 "update".to_string(),
                 "version".to_string(),
-            ],
-            ignore_window_titles: vec![
+            ].into_iter().collect(),
+            ignore_window_titles: [
                 // Common window titles to ignore by default
                 "Windows Security".to_string(),
                 "Action Center".to_string(),
+                // Google Meet and other video conferencing/screen sharing overlays
+                "Google Meet".to_string(),
+                "meet.google.com".to_string(),
+                "You're presenting".to_string(), // Covers "You're presenting to everyone"
+                "Stop presenting".to_string(),
+                "Zoom".to_string(),
+                "Zoom Meeting".to_string(),
+                "You are sharing your screen".to_string(),
+                "Stop sharing".to_string(),
+                "Loom".to_string(),
+                "loom.com".to_string(),
+                // Password manager overlays
+                "1Password".to_string(),
+                "LastPass".to_string(),
+                "Dashlane".to_string(),
+                "Bitwarden".to_string(),
                 // Browser screen sharing notifications
                 "is sharing your screen".to_string(),
                 "Screen sharing".to_string(),
@@ -199,8 +232,8 @@ impl Default for WorkflowRecorderConfig {
                 "Weather".to_string(),
                 "News and interests".to_string(),
                 "Widgets".to_string(),
-            ],
-            ignore_applications: vec![
+            ].into_iter().collect(),
+            ignore_applications: [
                 // Common applications to ignore by default
                 "dwm.exe".to_string(),
                 "taskmgr.exe".to_string(),
@@ -257,7 +290,14 @@ impl Default for WorkflowRecorderConfig {
                 // "googledrivesync.exe".to_string(),
                 // "skype.exe".to_string(),
                 // "zoom.exe".to_string(),
-            ],
+                // Password manager applications
+                "1Password.exe".to_string(),
+                "LastPass.exe".to_string(),
+                "Dashlane.exe".to_string(),
+                "Bitwarden.exe".to_string(),
+                // Snipping Tool application.
+                "SnippingTool.exe".to_string(),
+            ].into_iter().collect(),
         }
     }
 }

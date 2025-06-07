@@ -1,75 +1,1108 @@
 use crate::element::UIElementImpl;
 use crate::platforms::AccessibilityEngine;
-use crate::{ClickResult, CommandOutput, ScreenshotResult};
 use crate::{AutomationError, Locator, Selector, UIElement, UIElementAttributes};
-use std::fmt::Debug;
-use std::time::Duration;
+use crate::{ClickResult, CommandOutput, ScreenshotResult, UINode};
+use atspi::{State, StateSet};
+use std::collections::hash_map::DefaultHasher;
 use std::default::Default;
+use std::fmt::Debug;
+use std::future::Future;
+use std::hash::{Hash, Hasher};
+use std::pin::Pin;
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::{OnceLock, mpsc};
+use std::thread;
+use std::time::Duration;
+use tokio::time::sleep;
+use tracing::debug;
 
-pub struct LinuxEngine;
+use atspi::{
+    AccessibilityConnection, Role,
+    connection::set_session_accessibility,
+    proxy::accessible::{AccessibleProxy, ObjectRefExt},
+    zbus::{Connection, proxy::CacheProperties},
+};
+use atspi_common::{
+    CoordType,
+    object_match::{MatchType, ObjectMatchRule, SortOrder},
+    state,
+};
+use atspi_proxies::{
+    action::ActionProxy,
+    collection::CollectionProxy,
+    component::ComponentProxy,
+    device_event_controller::{DeviceEventControllerProxy, KeySynthType},
+    text::TextProxy,
+};
+use image::{DynamicImage, ImageBuffer, Rgba};
+use uni_ocr::{OcrEngine, OcrProvider};
+use zbus::fdo::DBusProxy;
+
+// Copied from atspi-common/src/role.rs (not public)
+const ROLE_NAMES: &[&str] = &[
+    "invalid",
+    "accelerator label",
+    "alert",
+    "animation",
+    "arrow",
+    "calendar",
+    "canvas",
+    "check box",
+    "check menu item",
+    "color chooser",
+    "column header",
+    "combo box",
+    "date editor",
+    "desktop icon",
+    "desktop frame",
+    "dial",
+    "dialog",
+    "directory pane",
+    "drawing area",
+    "file chooser",
+    "filler",
+    "focus traversable",
+    "font chooser",
+    "frame",
+    "glass pane",
+    "html container",
+    "icon",
+    "image",
+    "internal frame",
+    "label",
+    "layered pane",
+    "list",
+    "list item",
+    "menu",
+    "menu bar",
+    "menu item",
+    "option pane",
+    "page tab",
+    "page tab list",
+    "panel",
+    "password text",
+    "popup menu",
+    "progress bar",
+    "button",
+    "radio button",
+    "radio menu item",
+    "root pane",
+    "row header",
+    "scroll bar",
+    "scroll pane",
+    "separator",
+    "slider",
+    "spin button",
+    "split pane",
+    "status bar",
+    "table",
+    "table cell",
+    "table column header",
+    "table row header",
+    "tearoff menu item",
+    "terminal",
+    "text",
+    "toggle button",
+    "tool bar",
+    "tool tip",
+    "tree",
+    "tree table",
+    "unknown",
+    "viewport",
+    "window",
+    "extended",
+    "header",
+    "footer",
+    "paragraph",
+    "ruler",
+    "application",
+    "autocomplete",
+    "editbar",
+    "embedded",
+    "entry",
+    "chart",
+    "caption",
+    "document frame",
+    "heading",
+    "page",
+    "section",
+    "redundant object",
+    "form",
+    "link",
+    "input method window",
+    "table row",
+    "tree item",
+    "document spreadsheet",
+    "document presentation",
+    "document text",
+    "document web",
+    "document email",
+    "comment",
+    "list box",
+    "grouping",
+    "image map",
+    "notification",
+    "info bar",
+    "level bar",
+    "title bar",
+    "block quote",
+    "audio",
+    "video",
+    "definition",
+    "article",
+    "landmark",
+    "log",
+    "marquee",
+    "math",
+    "rating",
+    "timer",
+    "static",
+    "math fraction",
+    "math root",
+    "subscript",
+    "superscript",
+    "description list",
+    "description term",
+    "description value",
+    "footnote",
+    "content deletion",
+    "content insertion",
+    "mark",
+    "suggestion",
+    "push button menu",
+];
+
+// Linux-specific error handling
+impl From<zbus::Error> for AutomationError {
+    fn from(error: zbus::Error) -> Self {
+        AutomationError::PlatformError(error.to_string())
+    }
+}
+
+impl From<atspi_proxies::AtspiError> for AutomationError {
+    fn from(error: atspi_proxies::AtspiError) -> Self {
+        AutomationError::PlatformError(error.to_string())
+    }
+}
+
+const REGISTRY_DEST: &str = "org.a11y.atspi.Registry";
+const REGISTRY_PATH: &str = "/org/a11y/atspi/accessible/root";
+const ACCESSIBLE_INTERFACE: &str = "org.a11y.atspi.Accessible";
+
+// Thread-safe wrapper for AccessibleProxy
+#[derive(Debug, Clone)]
+pub struct ThreadSafeLinuxUIElement(pub Arc<AccessibleProxy<'static>>);
+unsafe impl Send for ThreadSafeLinuxUIElement {}
+unsafe impl Sync for ThreadSafeLinuxUIElement {}
+
+// Linux Engine struct
+#[derive(Clone)]
+pub struct LinuxEngine {
+    connection: Arc<Connection>,
+    root: ThreadSafeLinuxUIElement,
+}
+
+#[derive(Debug, Clone)]
+pub struct LinuxUIElement {
+    connection: Arc<Connection>,
+    destination: String,
+    path: String,
+}
+
+// --- Background Worker for Async AT-SPI Calls ---
+type Request = Box<
+    dyn FnOnce() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<UIElement>, AutomationError>> + Send>,
+        > + Send
+        + 'static,
+>;
+type Response = Result<Vec<UIElement>, AutomationError>;
+
+static WORKER: OnceLock<mpsc::Sender<(Request, mpsc::Sender<Response>)>> = OnceLock::new();
+
+// Worker for usize results
+type UsizeRequest = Box<
+    dyn FnOnce() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<usize, AutomationError>> + Send>,
+        > + Send
+        + 'static,
+>;
+type UsizeResponse = Result<usize, AutomationError>;
+
+static USIZE_WORKER: OnceLock<mpsc::Sender<(UsizeRequest, mpsc::Sender<UsizeResponse>)>> =
+    OnceLock::new();
+
+fn get_worker() -> &'static mpsc::Sender<(Request, mpsc::Sender<Response>)> {
+    WORKER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<(Request, mpsc::Sender<Response>)>();
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            for (req, resp_tx) in rx {
+                let fut = req();
+                let result = rt.block_on(fut);
+                let _ = resp_tx.send(result);
+            }
+        });
+        tx
+    })
+}
+
+fn get_usize_worker() -> &'static mpsc::Sender<(UsizeRequest, mpsc::Sender<UsizeResponse>)> {
+    USIZE_WORKER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<(UsizeRequest, mpsc::Sender<UsizeResponse>)>();
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            for (req, resp_tx) in rx {
+                let fut = req();
+                let result = rt.block_on(fut);
+                let _ = resp_tx.send(result);
+            }
+        });
+        tx
+    })
+}
+
+// Helper to erase the type of the async block to a trait object
+fn erase_future<F>(
+    fut: F,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Vec<UIElement>, AutomationError>> + Send>,
+>
+where
+    F: std::future::Future<Output = Result<Vec<UIElement>, AutomationError>> + Send + 'static,
+{
+    Box::pin(fut)
+}
+
+// Helper: Convert string to Role using ROLE_NAMES (case-insensitive)
+fn role_from_str(role: &str) -> Option<Role> {
+    let role_lc = role.to_lowercase();
+    for (idx, &name) in ROLE_NAMES.iter().enumerate() {
+        if name == role_lc {
+            return Role::try_from(idx as u32).ok();
+        }
+    }
+    None
+}
+
+// Helper: Recursively collect all elements from a root up to a given depth (breadth-first)
+pub async fn get_all_elements_from_root(
+    root: &UIElement,
+) -> Result<Vec<UIElement>, AutomationError> {
+    let mut all_elements = Vec::new();
+    let linux_elem = root
+        .as_any()
+        .downcast_ref::<LinuxUIElement>()
+        .ok_or_else(|| AutomationError::PlatformError("Invalid root element type".to_string()))?;
+
+    // Get the role of the root element
+    let root_role = linux_elem.role();
+    debug!("Root element role: {}", root_role);
+
+    if root_role == "desktop frame" {
+        // Get direct children of desktop frame
+        let root_proxy = AccessibleProxy::builder(&linux_elem.connection)
+            .destination(linux_elem.destination.as_str())
+            .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+            .path(linux_elem.path.as_str())
+            .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+            .interface(ACCESSIBLE_INTERFACE)?
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await
+            .map_err(|e| AutomationError::PlatformError(e.to_string()))?;
+
+        let root_children = root_proxy
+            .get_children()
+            .await
+            .map_err(|e: zbus::Error| AutomationError::PlatformError(e.to_string()))?;
+
+        // Filter children with child_count > 0
+        let mut children_with_descendants = Vec::new();
+        for child in &root_children {
+            let child_proxy = child
+                .clone()
+                .into_accessible_proxy(&linux_elem.connection)
+                .await
+                .map_err(|e: zbus::Error| AutomationError::PlatformError(e.to_string()))?;
+            let child_count = child_proxy
+                .child_count()
+                .await
+                .map_err(|e: zbus::Error| AutomationError::PlatformError(e.to_string()))?;
+            if child_count > 0 {
+                children_with_descendants.push(UIElement::new(Box::new(LinuxUIElement {
+                    connection: Arc::clone(&linux_elem.connection),
+                    destination: child_proxy.inner().destination().to_string(),
+                    path: child_proxy.inner().path().to_string(),
+                })));
+            }
+        }
+
+        // Add root element
+        all_elements.push(root.clone());
+        // Add direct children
+        all_elements.extend(children_with_descendants.iter().cloned());
+
+        // Use CollectionProxy with ObjectMatchRule for each child with descendants
+        let mut futures = Vec::new();
+        for child in &children_with_descendants {
+            let child_clone = child.clone();
+            let future = async move {
+                let linux_child = child_clone
+                    .as_any()
+                    .downcast_ref::<LinuxUIElement>()
+                    .ok_or_else(|| {
+                        AutomationError::PlatformError("Invalid child element type".to_string())
+                    })?;
+
+                let collection_proxy = CollectionProxy::builder(&linux_child.connection)
+                    .destination(linux_child.destination.as_str())
+                    .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+                    .path(linux_child.path.as_str())
+                    .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+                    .build()
+                    .await
+                    .map_err(|e| AutomationError::PlatformError(e.to_string()))?;
+
+                let match_rule = ObjectMatchRule::builder()
+                    .states(StateSet::new(State::Showing), MatchType::All)
+                    .build();
+                let collection_matches = collection_proxy
+                    .get_matches_from(
+                        &collection_proxy.inner().path(),
+                        match_rule,
+                        SortOrder::Canonical,
+                        atspi::TreeTraversalType::Inorder,
+                        0,
+                        true,
+                    )
+                    .await
+                    .map_err(|e| AutomationError::PlatformError(e.to_string()))?;
+
+                let mut child_elements = Vec::new();
+                for m in collection_matches {
+                    let proxy = m
+                        .into_accessible_proxy(&linux_child.connection)
+                        .await
+                        .map_err(|e: zbus::Error| AutomationError::PlatformError(e.to_string()))?;
+                    child_elements.push(UIElement::new(Box::new(LinuxUIElement {
+                        connection: Arc::clone(&linux_child.connection),
+                        destination: proxy.inner().destination().to_string(),
+                        path: proxy.inner().path().to_string(),
+                    })));
+                }
+                Ok::<Vec<UIElement>, AutomationError>(child_elements)
+            };
+            futures.push(future);
+        }
+        // Join all futures to get descendants
+        let results = futures::future::try_join_all(futures).await?;
+        for child_elements in results {
+            all_elements.extend(child_elements);
+        }
+    } else {
+        // For non-desktop frame root, directly use CollectionProxy
+        let root_proxy = AccessibleProxy::builder(&linux_elem.connection)
+            .destination(linux_elem.destination.as_str())
+            .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+            .path(linux_elem.path.as_str())
+            .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+            .interface(ACCESSIBLE_INTERFACE)?
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await
+            .map_err(|e| AutomationError::PlatformError(e.to_string()))?;
+
+        let destination = root_proxy.inner().destination().to_string();
+        let path = root_proxy.inner().path().to_string();
+        let collection_proxy = CollectionProxy::builder(&linux_elem.connection)
+            .destination(destination.as_str())
+            .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+            .path(path.as_str())
+            .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+            .build()
+            .await
+            .map_err(|e| AutomationError::PlatformError(e.to_string()))?;
+
+        let match_rule = ObjectMatchRule::builder()
+            .states(StateSet::new(State::Showing), MatchType::All)
+            .build();
+
+        let collection_matches = collection_proxy
+            .get_matches_from(
+                &collection_proxy.inner().path(),
+                match_rule,
+                SortOrder::Canonical,
+                atspi::TreeTraversalType::Inorder,
+                0,
+                true,
+            )
+            .await
+            .map_err(|e| AutomationError::PlatformError(e.to_string()))?;
+
+        // Add root element
+        all_elements.push(root.clone());
+        // Add all matched elements
+        for m in collection_matches {
+            let proxy = m
+                .into_accessible_proxy(&linux_elem.connection)
+                .await
+                .map_err(|e: zbus::Error| AutomationError::PlatformError(e.to_string()))?;
+            all_elements.push(UIElement::new(Box::new(LinuxUIElement {
+                connection: Arc::clone(&linux_elem.connection),
+                destination: proxy.inner().destination().to_string(),
+                path: proxy.inner().path().to_string(),
+            })));
+        }
+    }
+    Ok(all_elements)
+}
+
+fn find_elements_inner<'a>(
+    linux_engine: &'a LinuxEngine,
+    selector: &'a Selector,
+    root: Option<&'a UIElement>,
+    depth: Option<usize>,
+) -> Pin<Box<dyn Future<Output = Result<Vec<UIElement>, AutomationError>> + Send + 'a>> {
+    Box::pin(async move {
+        use crate::Selector;
+        match selector {
+            Selector::Attributes(_) => {
+                return Err(AutomationError::UnsupportedPlatform(
+                    "Selector::Attributes is not implemented for Linux".to_string(),
+                ));
+            }
+            Selector::Filter(_) => {
+                return Err(AutomationError::UnsupportedPlatform(
+                    "Selector::Filter is not implemented for Linux".to_string(),
+                ));
+            }
+            Selector::Path(_) => {
+                return Err(AutomationError::UnsupportedPlatform(
+                    "Selector::Path is not implemented for Linux".to_string(),
+                ));
+            }
+            Selector::ClassName(_) => {
+                return Err(AutomationError::UnsupportedPlatform(
+                    "Selector::ClassName is not implemented for Linux".to_string(),
+                ));
+            }
+            Selector::NativeId(_) => {
+                return Err(AutomationError::UnsupportedPlatform(
+                    "Selector::NativeId is not implemented for Linux".to_string(),
+                ));
+            }
+            Selector::Text(_) => {
+                return Err(AutomationError::UnsupportedPlatform(
+                    "Selector::Text is not implemented for Linux".to_string(),
+                ));
+            }
+            Selector::Id(target_id) => {
+                // Traverse the tree from root, collect elements whose object_id matches target_id
+                let root_binding = linux_engine.get_root_element();
+                let root_elem = root.unwrap_or(&root_binding);
+                let all_elements = get_all_elements_from_root(root_elem).await?;
+                let results: Vec<UIElement> = all_elements
+                    .into_iter()
+                    .filter(|elem| elem.id() == Some(target_id.clone()))
+                    .collect();
+                if results.is_empty() {
+                    return Err(AutomationError::ElementNotFound(format!(
+                        "No element found with ID '{}';",
+                        target_id
+                    )));
+                }
+                return Ok(results);
+            }
+            Selector::Chain(chain) => {
+                if chain.is_empty() {
+                    return Err(AutomationError::InvalidArgument(
+                        "Selector chain cannot be empty".to_string(),
+                    ));
+                }
+                let mut current_elements = if let Some(r) = root {
+                    vec![r.clone()]
+                } else {
+                    vec![linux_engine.get_root_element()]
+                };
+                for sel in chain {
+                    let mut next_elements = Vec::new();
+                    for elem in &current_elements {
+                        let found =
+                            find_elements_inner(linux_engine, sel, Some(elem), depth).await?;
+                        next_elements.extend(found);
+                    }
+                    if next_elements.is_empty() {
+                        return Err(AutomationError::ElementNotFound(
+                            "Element not found after traversing chain".to_string(),
+                        ));
+                    }
+                    current_elements = next_elements;
+                }
+                return Ok(current_elements);
+            }
+            Selector::Role { .. } | Selector::Name(_) => {
+                // Supported
+            }
+        }
+        // Only Role and Name selectors are supported below
+        let root_binding = linux_engine.get_root_element();
+        let root_elem = root.unwrap_or(&root_binding);
+        // Get all elements from the root
+        let all_elements = get_all_elements_from_root(root_elem).await?;
+
+        // Extract search criteria from selector
+        let (target_role, name_contains) = match selector {
+            Selector::Role { role, name } => (Some(role.to_lowercase()), name.clone()),
+            Selector::Name(name) => (None, Some(name.clone())),
+            _ => unreachable!(),
+        };
+
+        // Convert role string to Role enum if provided
+        let role_enums: Option<Vec<Role>> = target_role.as_ref().map(|r| match r.as_str() {
+            "window" => {
+                let mut v = Vec::new();
+                if let Some(win) = role_from_str("window") {
+                    v.push(win);
+                }
+                if let Some(frame) = role_from_str("frame") {
+                    v.push(frame);
+                }
+                v
+            }
+            "frame" => {
+                let mut v = Vec::new();
+                if let Some(win) = role_from_str("window") {
+                    v.push(win);
+                }
+                if let Some(frame) = role_from_str("frame") {
+                    v.push(frame);
+                }
+                v
+            }
+            _ => role_from_str(r).map(|x| vec![x]).unwrap_or_default(),
+        });
+
+        let mut results = Vec::new();
+        for element in all_elements {
+            let linux_elem = element
+                .as_any()
+                .downcast_ref::<LinuxUIElement>()
+                .ok_or_else(|| {
+                    AutomationError::PlatformError("Invalid element type".to_string())
+                })?;
+            let proxy = AccessibleProxy::builder(&linux_elem.connection)
+                .destination(linux_elem.destination.as_str())
+                .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+                .path(linux_elem.path.as_str())
+                .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+                .interface(ACCESSIBLE_INTERFACE)?
+                .cache_properties(CacheProperties::No)
+                .build()
+                .await
+                .map_err(|e| AutomationError::PlatformError(e.to_string()))?;
+            let role = proxy
+                .get_role()
+                .await
+                .map_err(|e: zbus::Error| AutomationError::PlatformError(e.to_string()))?;
+            let name = proxy
+                .name()
+                .await
+                .map_err(|e: zbus::Error| AutomationError::PlatformError(e.to_string()))?;
+            let role_matches = role_enums
+                .as_ref()
+                .map_or(true, |targets| targets.contains(&role));
+            let name_matches = name_contains
+                .as_ref()
+                .map_or(true, |target| name.contains(target));
+            if role_matches && name_matches {
+                results.push(element);
+                if depth == Some(1) {
+                    break;
+                }
+            }
+        }
+        Ok(results)
+    })
+}
+
+fn find_elements_sync(
+    engine: &LinuxEngine,
+    selector: &Selector,
+    root: Option<&UIElement>,
+    timeout: Option<Duration>,
+    depth: Option<usize>,
+) -> Result<Vec<UIElement>, AutomationError> {
+    let selector = selector.clone();
+    let root = root.cloned();
+    let engine = engine.clone();
+    let (resp_tx, resp_rx) = mpsc::channel();
+    let req = Box::new(move || {
+        erase_future(
+            async move { find_elements_inner(&engine, &selector, root.as_ref(), depth).await },
+        )
+    });
+    get_worker().send((req, resp_tx)).unwrap();
+    match timeout {
+        Some(dur) => resp_rx
+            .recv_timeout(dur)
+            .unwrap_or_else(|_| Err(AutomationError::Timeout("Timeout".into()))),
+        None => resp_rx.recv().unwrap(),
+    }
+}
+
+// Helper: Find the first focused element in a list, with CollectionProxy fallback
+async fn find_focused_element_async(elements: &[UIElement]) -> Result<UIElement, AutomationError> {
+    use atspi::object_match::{MatchType, ObjectMatchRule, SortOrder};
+    use atspi_common::state::{State, StateSet};
+    use atspi_proxies::{accessible::AccessibleProxy, collection::CollectionProxy};
+    // First, check if any element is focused
+    let mut children_with_count = Vec::new();
+    for element in elements {
+        if element.is_focused().unwrap_or(false) {
+            return Ok(element.clone());
+        }
+        // Save elements with child_count > 0 for fallback
+        let linux_elem = element.as_any().downcast_ref::<LinuxUIElement>();
+        if let Some(linux_elem) = linux_elem {
+            let child_count = AccessibleProxy::builder(&linux_elem.connection)
+                .destination(linux_elem.destination.as_str())
+                .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+                .path(linux_elem.path.as_str())
+                .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+                .build()
+                .await
+                .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+                .child_count()
+                .await
+                .unwrap_or(0);
+            if child_count > 0 {
+                children_with_count.push(element.clone());
+            }
+        }
+    }
+    // Fallback: use CollectionProxy with StateSet matcher on each element
+    for element in children_with_count {
+        let linux_elem = element.as_any().downcast_ref::<LinuxUIElement>();
+        if let Some(linux_elem) = linux_elem {
+            let collection_proxy_result = CollectionProxy::builder(&linux_elem.connection)
+                .destination(linux_elem.destination.as_str())
+                .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+                .path(linux_elem.path.as_str())
+                .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+                .build()
+                .await;
+            let collection_proxy = match collection_proxy_result {
+                Ok(proxy) => proxy,
+                Err(_) => continue,
+            };
+            let match_rule = ObjectMatchRule::builder()
+                .states(StateSet::new(State::Focused), MatchType::All)
+                .build();
+            let matches = collection_proxy
+                .get_matches_from(
+                    &collection_proxy.inner().path(),
+                    match_rule,
+                    SortOrder::Canonical,
+                    atspi::TreeTraversalType::Inorder,
+                    0,
+                    true,
+                )
+                .await;
+            if let Ok(matches) = matches {
+                if !matches.is_empty() {
+                    return Ok(element.clone());
+                }
+            }
+        }
+    }
+    Err(AutomationError::ElementNotFound(
+        "No focused element found".to_string(),
+    ))
+}
+
+/// Generate a stable element ID for a Linux UI element using accessibility properties
+fn generate_element_id(
+    connection: &Arc<Connection>,
+    destination: &str,
+    path: &str,
+) -> Result<usize, AutomationError> {
+    let connection = Arc::clone(connection);
+    let destination = destination.to_string();
+    let path = path.to_string();
+    let (resp_tx, resp_rx) = mpsc::channel();
+    let req = Box::new(move || {
+        Box::pin(async move {
+            let proxy = AccessibleProxy::builder(&connection)
+                .destination(destination.as_str())
+                .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+                .path(path.as_str())
+                .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+                .build()
+                .await
+                .map_err(|e| AutomationError::PlatformError(e.to_string()))?;
+            // Get application (ObjectRef)
+            let application = proxy.get_application().await.ok();
+            // Get attributes
+            let attributes = proxy.get_attributes().await.unwrap_or_default();
+            // Sort attributes to ensure consistent ordering
+            let mut sorted_attrs: Vec<(&str, &str)> = attributes
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            sorted_attrs.sort_by(|a, b| a.0.cmp(b.0));
+            // Get role
+            let role = proxy.get_role().await.ok();
+            // Get description
+            let description = proxy.description().await.ok();
+            // Get name
+            let name = proxy.name().await.ok();
+
+            // Build a stable string
+            let mut id_string = String::new();
+            if let Some(app) = &application {
+                id_string.push_str(&format!("app:{}:{};", app.name, app.path));
+                tracing::trace!("ID component - app: {}:{}", app.name, app.path);
+            }
+            for (k, v) in &sorted_attrs {
+                id_string.push_str(&format!("attr:{}={};", k, v));
+                tracing::trace!("ID component - attr: {}={}", k, v);
+            }
+            if let Some(role) = &role {
+                id_string.push_str(&format!("role:{};", role.to_string()));
+                tracing::trace!("ID component - role: {}", role.to_string());
+            }
+            if let Some(desc) = &description {
+                id_string.push_str(&format!("desc:{};", desc));
+                tracing::trace!("ID component - desc: {}", desc);
+            }
+            if let Some(name) = &name {
+                id_string.push_str(&format!("name:{};", name));
+                tracing::trace!("ID component - name: {}", name);
+            }
+            // Hash the string
+            let mut hasher = DefaultHasher::new();
+            id_string.hash(&mut hasher);
+            tracing::trace!(
+                "Generated ID string: {}, Hash: {}",
+                id_string,
+                hasher.finish()
+            );
+            Ok(hasher.finish() as usize)
+        }) as Pin<Box<dyn Future<Output = Result<usize, AutomationError>> + Send>>
+    });
+    get_usize_worker().send((req, resp_tx)).unwrap();
+    resp_rx.recv().unwrap()
+}
+
+/// Helper method to get accessible attributes using AccessibleProxy
+fn get_accessible_attributes(
+    element: &LinuxUIElement,
+) -> Result<std::collections::HashMap<String, String>, AutomationError> {
+    use std::sync::mpsc;
+    let (resp_tx, resp_rx) = mpsc::channel();
+    let this = element.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async move {
+            let proxy = AccessibleProxy::builder(&this.connection)
+                .destination(this.destination.as_str())
+                .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+                .path(this.path.as_str())
+                .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+                .build()
+                .await
+                .map_err(|e| AutomationError::PlatformError(e.to_string()))?;
+            let attributes = proxy
+                .get_attributes()
+                .await
+                .map_err(|e: zbus::Error| AutomationError::PlatformError(e.to_string()))?;
+            Ok(attributes)
+        });
+        let _ = resp_tx.send(result);
+    });
+    resp_rx.recv().unwrap()
+}
+
+// Static channel for managing AT-SPI connection initialization
+static AT_SPI_INIT_WORKER: OnceLock<
+    mpsc::Sender<((), mpsc::Sender<Result<LinuxEngine, AutomationError>>)>,
+> = OnceLock::new();
+
+fn get_at_spi_worker()
+-> &'static mpsc::Sender<((), mpsc::Sender<Result<LinuxEngine, AutomationError>>)> {
+    AT_SPI_INIT_WORKER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<((), mpsc::Sender<Result<LinuxEngine, AutomationError>>)>();
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            for (_, resp_tx) in rx {
+                let result = rt.block_on(async {
+                    set_session_accessibility(true).await?;
+                    let accessibility_connection = AccessibilityConnection::new().await?;
+                    let connection = Arc::new(accessibility_connection.connection().clone());
+                    let registry = AccessibleProxy::builder(&connection)
+                        .destination(REGISTRY_DEST)?
+                        .path(REGISTRY_PATH)?
+                        .interface(ACCESSIBLE_INTERFACE)?
+                        .cache_properties(CacheProperties::No)
+                        .build()
+                        .await?;
+
+                    let root = ThreadSafeLinuxUIElement(Arc::new(registry));
+                    Ok(LinuxEngine { connection, root })
+                });
+                let _ = resp_tx.send(result);
+            }
+        });
+        tx
+    })
+}
 
 impl LinuxEngine {
-    pub fn new(use_background_apps: bool, activate_app: bool) -> Result<Self, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
+    pub fn new(_use_background_apps: bool, _activate_app: bool) -> Result<Self, AutomationError> {
+        let (resp_tx, resp_rx) = mpsc::channel();
+        get_at_spi_worker().send(((), resp_tx)).unwrap();
+        resp_rx.recv().map_err(|e| {
+            AutomationError::PlatformError(format!(
+                "Failed to receive result from AT-SPI worker: {}",
+                e
+            ))
+        })?
     }
 }
 
 #[async_trait::async_trait]
 impl AccessibilityEngine for LinuxEngine {
     fn get_root_element(&self) -> UIElement {
-        panic!("Linux implementation is not yet available")
+        UIElement::new(Box::new(LinuxUIElement {
+            connection: Arc::clone(&self.connection),
+            destination: self.root.0.inner().destination().to_string(),
+            path: self.root.0.inner().path().to_string(),
+        }))
+    }
+
+    fn get_element_by_id(&self, _id: i32) -> Result<UIElement, AutomationError> {
+        Err(AutomationError::UnsupportedPlatform(
+            "get_element_by_id not yet implemented for Linux".to_string(),
+        ))
     }
 
     fn get_focused_element(&self) -> Result<UIElement, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel();
+        let this = self.clone();
+        let req = Box::new(move || {
+            erase_future(async move {
+                let apps = this.get_applications()?;
+                match find_focused_element_async(&apps).await {
+                    Ok(element) => Ok(vec![element]),
+                    Err(e) => Err(e),
+                }
+            })
+        });
+        get_worker().send((req, resp_tx)).unwrap();
+        match resp_rx.recv().unwrap() {
+            Ok(mut v) => v.pop().ok_or_else(|| {
+                AutomationError::ElementNotFound("No focused element found".to_string())
+            }),
+            Err(e) => Err(e),
+        }
     }
 
     fn get_applications(&self) -> Result<Vec<UIElement>, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
+        let (resp_tx, resp_rx) = mpsc::channel();
+        let this = self.clone();
+        let req = Box::new(move || {
+            erase_future(async move {
+                let apps = this
+                    .root
+                    .0
+                    .get_children()
+                    .await
+                    .map_err(|e: zbus::Error| AutomationError::PlatformError(e.to_string()))?;
+                let mut elements = Vec::new();
+                for app in apps {
+                    let proxy = app
+                        .into_accessible_proxy(this.connection.as_ref())
+                        .await
+                        .map_err(|e: zbus::Error| AutomationError::PlatformError(e.to_string()))?;
+                    let child_count = proxy.child_count().await?;
+                    if child_count > 0 {
+                        elements.push(UIElement::new(Box::new(LinuxUIElement {
+                            connection: Arc::clone(&this.connection),
+                            destination: proxy.inner().destination().to_string(),
+                            path: proxy.inner().path().to_string(),
+                        })));
+                    }
+                }
+                Ok(elements)
+            })
+        });
+        get_worker().send((req, resp_tx)).unwrap();
+        resp_rx.recv().unwrap()
     }
 
-    fn get_application_by_name(&self, _name: &str) -> Result<UIElement, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
+    fn get_application_by_name(&self, name: &str) -> Result<UIElement, AutomationError> {
+        let selector = Selector::Role {
+            role: "application".to_string(),
+            name: Some(name.to_string()),
+        };
+        self.find_element(&selector, None, None)
     }
 
-    fn get_application_by_pid(&self, _pid: i32, _timeout: Option<Duration>) -> Result<UIElement, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
+    fn get_application_by_pid(
+        &self,
+        pid: i32,
+        _timeout: Option<Duration>,
+    ) -> Result<UIElement, AutomationError> {
+        let apps = self.get_applications()?;
+        for app in apps {
+            if let Ok(app_pid) = app.process_id() {
+                if app_pid as i32 == pid {
+                    return Ok(app);
+                }
+            }
+        }
+        Err(AutomationError::ElementNotFound(format!(
+            "No application found with PID {}",
+            pid
+        )))
     }
 
     fn find_element(
         &self,
         selector: &Selector,
         root: Option<&UIElement>,
+        timeout: Option<Duration>,
     ) -> Result<UIElement, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
+        let elements = find_elements_sync(self, selector, root, timeout, Some(1))?;
+        elements
+            .into_iter()
+            .next()
+            .ok_or_else(|| AutomationError::ElementNotFound("No element found".to_string()))
     }
 
     fn find_elements(
         &self,
-        _selector: &Selector,
-        _root: Option<&UIElement>,
+        selector: &Selector,
+        root: Option<&UIElement>,
+        timeout: Option<Duration>,
+        depth: Option<usize>,
     ) -> Result<Vec<UIElement>, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
+        find_elements_sync(self, selector, root, timeout, depth)
     }
 
-    fn open_application(&self, _app_name: &str) -> Result<UIElement, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
+    fn open_application(&self, app_name: &str) -> Result<UIElement, AutomationError> {
+        let app_name = app_name.to_string();
+        // First, try launching the application directly
+        let mut output = Command::new("setsid")
+            .arg(app_name.clone())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| AutomationError::PlatformError(e.to_string()));
+
+        // If direct launch fails, try fallbacks
+        if output.is_err() {
+            debug!("Direct launch of '{}' failed, trying gtk-launch", app_name);
+            output = Command::new("setsid")
+                .arg(format!("gtk-launch {}", app_name))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| AutomationError::PlatformError(format!("gtk-launch failed: {}", e)));
+        }
+
+        // If all attempts fail, return the last error
+        let output = output?;
+        // Wait for the application to appear
+        let pid = output.id() as i32;
+
+        // Check if the process exists
+        let process_exists = Command::new("ps")
+            .arg(pid.to_string())
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+
+        let pid = if !process_exists {
+            debug!(
+                "Process with PID {} has exited, using pgrep to find latest {}",
+                pid, app_name
+            );
+            let pgrep_output = Command::new("pgrep")
+                .arg("-n")
+                .arg(&app_name)
+                .output()
+                .map_err(|e| AutomationError::PlatformError(format!("pgrep failed: {}", e)))?;
+            if pgrep_output.status.success() {
+                let pid_str = String::from_utf8_lossy(&pgrep_output.stdout)
+                    .trim()
+                    .to_string();
+                pid_str.parse::<i32>().map_err(|e| {
+                    AutomationError::PlatformError(format!("Failed to parse PID from pgrep: {}", e))
+                })?
+            } else {
+                return Err(AutomationError::ElementNotFound(format!(
+                    "No process found for '{}' using pgrep",
+                    app_name
+                )));
+            }
+        } else {
+            pid
+        };
+
+        // Wait for the application to appear in the accessibility tree
+        for _ in 0..10 {
+            if let Ok(app) = self.get_application_by_pid(pid, None) {
+                return Ok(app);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        Err(AutomationError::ElementNotFound(format!(
+            "Application '{}' not found after launch",
+            app_name
+        )))
+    }
+
+    fn activate_application(&self, app_name: &str) -> Result<(), AutomationError> {
+        let (resp_tx, resp_rx) = mpsc::channel();
+        let this = self.clone();
+        let app_name = app_name.to_string();
+        let req = Box::new(move || {
+            erase_future(async move {
+                let selector = Selector::Role {
+                    role: "application".to_string(),
+                    name: Some(app_name.clone()),
+                };
+                if let Ok(app) = this.find_element(&selector, None, None) {
+                    // Try to find a window to activate
+                    let mut windows = Vec::new();
+                    for child in app.children()? {
+                        if child.role() == "frame" || child.role() == "window" {
+                            windows.push(child);
+                        }
+                    }
+                    if let Some(window) = windows.first() {
+                        window.focus()?;
+                        return Ok(vec![]);
+                    }
+                    // If no window found, try focusing the application itself
+                    app.focus()?;
+                    Ok(vec![])
+                } else {
+                    Err(AutomationError::ElementNotFound(format!(
+                        "Application '{}' not found",
+                        app_name
+                    )))
+                }
+            })
+        });
+        get_worker().send((req, resp_tx)).unwrap();
+        match resp_rx.recv().unwrap() {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     fn open_url(&self, _url: &str, _browser: Option<&str>) -> Result<UIElement, AutomationError> {
@@ -84,47 +1117,155 @@ impl AccessibilityEngine for LinuxEngine {
         ))
     }
 
-    fn run_command(
+    async fn run_command(
         &self,
-        _windows_command: Option<&str>,
-        _unix_command: Option<&str>,
-    ) -> Result<crate::CommandOutput, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
+        windows_command: Option<&str>,
+        unix_command: Option<&str>,
+    ) -> Result<CommandOutput, AutomationError> {
+        let command = unix_command.ok_or_else(|| {
+            AutomationError::InvalidArgument("Unix command is required for Linux".to_string())
+        })?;
+
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .map_err(|e| {
+                AutomationError::PlatformError(format!("Failed to execute command: {}", e))
+            })?;
+
+        Ok(CommandOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_status: Some(output.status.code().unwrap_or(-1)),
+        })
     }
 
-    fn capture_screen(&self) -> Result<ScreenshotResult, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
+    async fn capture_screen(&self) -> Result<ScreenshotResult, AutomationError> {
+        let monitors = xcap::Monitor::all().map_err(|e| {
+            AutomationError::PlatformError(format!("Failed to get monitors: {}", e))
+        })?;
+        let mut primary_monitor: Option<xcap::Monitor> = None;
+        for monitor in monitors {
+            match monitor.is_primary() {
+                Ok(true) => {
+                    primary_monitor = Some(monitor);
+                    break;
+                }
+                Ok(false) => continue,
+                Err(e) => {
+                    return Err(AutomationError::PlatformError(format!(
+                        "Error checking monitor primary status: {}",
+                        e
+                    )));
+                }
+            }
+        }
+        let primary_monitor = primary_monitor.ok_or_else(|| {
+            AutomationError::PlatformError("Could not find primary monitor".to_string())
+        })?;
+
+        let image = primary_monitor.capture_image().map_err(|e| {
+            AutomationError::PlatformError(format!("Failed to capture screen: {}", e))
+        })?;
+
+        Ok(ScreenshotResult {
+            image_data: image.to_vec(),
+            width: image.width(),
+            height: image.height(),
+        })
     }
 
-    fn capture_monitor_by_name(&self, _name: &str) -> Result<ScreenshotResult, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    async fn ocr_image_path(&self, _image_path: &str) -> Result<String, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    async fn ocr_screenshot(&self, _screenshot: &ScreenshotResult) -> Result<String, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    async fn find_window_by_criteria(
+    async fn capture_monitor_by_name(
         &self,
-        title_contains: Option<&str>,
-        timeout: Option<Duration>,
-    ) -> Result<UIElement, AutomationError> {
+        name: &str,
+    ) -> Result<ScreenshotResult, AutomationError> {
+        let monitors = xcap::Monitor::all().map_err(|e| {
+            AutomationError::PlatformError(format!("Failed to get monitors: {}", e))
+        })?;
+        let mut target_monitor: Option<xcap::Monitor> = None;
+        for monitor in monitors {
+            match monitor.name() {
+                Ok(monitor_name) if monitor_name == name => {
+                    target_monitor = Some(monitor);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    return Err(AutomationError::PlatformError(format!(
+                        "Error getting monitor name: {}",
+                        e
+                    )));
+                }
+            }
+        }
+        let target_monitor = target_monitor.ok_or_else(|| {
+            AutomationError::ElementNotFound(format!("Monitor '{}' not found", name))
+        })?;
+
+        let image = target_monitor.capture_image().map_err(|e| {
+            AutomationError::PlatformError(format!("Failed to capture monitor '{}': {}", name, e))
+        })?;
+
+        Ok(ScreenshotResult {
+            image_data: image.to_vec(),
+            width: image.width(),
+            height: image.height(),
+        })
+    }
+
+    async fn ocr_image_path(&self, image_path: &str) -> Result<String, AutomationError> {
+        let engine = OcrEngine::new(OcrProvider::Auto).map_err(|e| {
+            AutomationError::PlatformError(format!("Failed to create OCR engine: {}", e))
+        })?;
+
+        let (text, _language, _confidence) = engine // Destructure the tuple
+            .recognize_file(image_path)
+            .await
+            .map_err(|e| {
+                AutomationError::PlatformError(format!("OCR recognition failed: {}", e))
+            })?;
+
+        Ok(text) // Return only the text
+    }
+
+    async fn ocr_screenshot(
+        &self,
+        screenshot: &ScreenshotResult,
+    ) -> Result<String, AutomationError> {
+        // Reconstruct the image buffer from raw data
+        let img_buffer: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_raw(
+            screenshot.width,
+            screenshot.height,
+            screenshot.image_data.clone(), // Clone data into the buffer
+        )
+        .ok_or_else(|| {
+            AutomationError::InvalidArgument(
+                "Invalid screenshot data for buffer creation".to_string(),
+            )
+        })?;
+
+        // Convert to DynamicImage
+        let dynamic_image = DynamicImage::ImageRgba8(img_buffer);
+
+        // Directly await the OCR operation within the existing async context
+        let engine = OcrEngine::new(OcrProvider::Auto).map_err(|e| {
+            AutomationError::PlatformError(format!("Failed to create OCR engine: {}", e))
+        })?;
+
+        let (text, _language, _confidence) = engine
+            .recognize_image(&dynamic_image) // Use recognize_image
+            .await // << Directly await here
+            .map_err(|e| {
+                AutomationError::PlatformError(format!("OCR recognition failed: {}", e))
+            })?;
+
+        Ok(text)
+    }
+
+    fn activate_browser_window_by_title(&self, _title: &str) -> Result<(), AutomationError> {
         Err(AutomationError::UnsupportedPlatform(
-            "find_window_by_criteria not yet implemented for Linux".to_string(),
+            "Linux implementation is not yet available".to_string(),
         ))
     }
 
@@ -135,255 +1276,693 @@ impl AccessibilityEngine for LinuxEngine {
     }
 
     async fn get_current_window(&self) -> Result<UIElement, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "get_current_window not yet implemented for Linux".to_string(),
-        ))
+        let applications = self.get_applications()?;
+        let mut all_windows = Vec::new();
+        for application in &applications {
+            if let Ok(children) = application.children() {
+                all_windows.extend(children);
+            }
+        }
+        find_focused_element_async(&all_windows).await
     }
 
     async fn get_current_application(&self) -> Result<UIElement, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "get_current_application not yet implemented for Linux".to_string(),
-        ))
+        let apps = self.get_applications()?;
+        find_focused_element_async(&apps).await
     }
 
-    fn get_window_tree_by_title(&self, title: &str) -> Result<crate::UINode, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            format!("get_window_tree_by_title for '{}' not yet implemented for Linux", title)
-        ))
+    fn get_window_tree(
+        &self,
+        pid: u32,
+        title: Option<&str>,
+        _config: crate::platforms::TreeBuildConfig,
+    ) -> Result<crate::UINode, AutomationError> {
+        Err(AutomationError::UnsupportedPlatform(format!(
+            "get_window_tree for PID {} and title {:?} not yet implemented for Linux",
+            pid, title
+        )))
     }
 
     async fn get_active_monitor_name(&self) -> Result<String, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
+        // Get all windows
+        let windows = xcap::Window::all()
+            .map_err(|e| AutomationError::PlatformError(format!("Failed to get windows: {}", e)))?;
+
+        // Find the focused window
+        let focused_window = windows
+            .iter()
+            .find(|w| w.is_focused().unwrap_or(false))
+            .ok_or_else(|| {
+                AutomationError::ElementNotFound("No focused window found".to_string())
+            })?;
+
+        // Get the monitor name for the focused window
+        let monitor = focused_window.current_monitor().map_err(|e| {
+            AutomationError::PlatformError(format!("Failed to get current monitor: {}", e))
+        })?;
+
+        let monitor_name = monitor.name().map_err(|e| {
+            AutomationError::PlatformError(format!("Failed to get monitor name: {}", e))
+        })?;
+
+        Ok(monitor_name)
     }
 
-    fn get_element_by_id(&self, _id: i32) -> Result<UIElement, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl UIElementImpl for LinuxUIElement {
+    fn object_id(&self) -> usize {
+        generate_element_id(&self.connection, &self.destination, &self.path).unwrap_or(0)
     }
 
-    fn find_element(
+    fn id(&self) -> Option<String> {
+        Some(self.object_id().to_string())
+    }
+
+    fn role(&self) -> String {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<String, AutomationError>>,
+            mpsc::Receiver<Result<String, AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let builder = AccessibleProxy::builder(&this.connection);
+                let builder = match builder.destination(this.destination.as_str()) {
+                    Ok(b) => b,
+                    Err(_) => return Ok(String::new()),
+                };
+                let builder = match builder.path(this.path.as_str()) {
+                    Ok(b) => b,
+                    Err(_) => return Ok(String::new()),
+                };
+                let proxy_result = builder.build().await;
+                let role = match proxy_result {
+                    Ok(proxy) => proxy
+                        .get_role()
+                        .await
+                        .map(|r| r.to_string())
+                        .unwrap_or_default(),
+                    Err(_) => String::new(),
+                };
+                Ok(role)
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap().unwrap_or_default()
+    }
+
+    fn attributes(&self) -> UIElementAttributes {
+        let mut attrs = UIElementAttributes::default();
+        attrs.role = self.role();
+        attrs.name = self.name();
+        attrs.value = Some(self.is_enabled().unwrap_or(false).to_string());
+        attrs.is_keyboard_focusable = Some(self.is_focused().unwrap_or(false));
+
+        // Fetch additional attributes using AccessibleProxy
+        if let Ok(attributes) = get_accessible_attributes(self) {
+            // Convert HashMap<String, String> to HashMap<String, Option<serde_json::Value>>
+            let converted_attributes: std::collections::HashMap<String, Option<serde_json::Value>> =
+                attributes
+                    .into_iter()
+                    .map(|(k, v)| (k, Some(serde_json::Value::String(v))))
+                    .collect();
+            attrs.properties = converted_attributes;
+        }
+
+        attrs
+    }
+
+    fn name(&self) -> Option<String> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<Option<String>, AutomationError>>,
+            mpsc::Receiver<Result<Option<String>, AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let proxy = AccessibleProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())
+                    .map_err(|_| AutomationError::PlatformError("No destination".to_string()))?
+                    .path(this.path.as_str())
+                    .map_err(|_| AutomationError::PlatformError("No path".to_string()))?
+                    .build()
+                    .await
+                    .map_err(|_| AutomationError::PlatformError("Build failed".to_string()))?;
+                Ok(proxy.name().await.ok())
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap().unwrap_or(None)
+    }
+
+    fn children(&self) -> Result<Vec<UIElement>, AutomationError> {
+        let (resp_tx, resp_rx) = mpsc::channel();
+        let this = self.clone();
+        let req = Box::new(move || {
+            erase_future(async move {
+                let proxy = AccessibleProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                let children = proxy
+                    .get_children()
+                    .await
+                    .map_err(|e: zbus::Error| AutomationError::PlatformError(e.to_string()))?;
+                let mut elements = Vec::new();
+                for child in children {
+                    let proxy = child
+                        .into_accessible_proxy(this.connection.as_ref())
+                        .await
+                        .map_err(|e: zbus::Error| AutomationError::PlatformError(e.to_string()))?;
+                    elements.push(UIElement::new(Box::new(LinuxUIElement {
+                        connection: std::sync::Arc::clone(&this.connection),
+                        destination: proxy.inner().destination().to_string(),
+                        path: proxy.inner().path().to_string(),
+                    })));
+                }
+                Ok(elements)
+            })
+        });
+        get_worker().send((req, resp_tx)).unwrap();
+        resp_rx.recv().unwrap()
+    }
+
+    fn parent(&self) -> Result<Option<UIElement>, AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<Option<UIElement>, AutomationError>>,
+            mpsc::Receiver<Result<Option<UIElement>, AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let proxy = AccessibleProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                if let Ok(parent) = proxy.parent().await {
+                    let proxy = parent
+                        .into_accessible_proxy(this.connection.as_ref())
+                        .await
+                        .map_err(|e: zbus::Error| AutomationError::PlatformError(e.to_string()))?;
+                    Ok(Some(UIElement::new(Box::new(LinuxUIElement {
+                        connection: std::sync::Arc::clone(&this.connection),
+                        destination: proxy.inner().destination().to_string(),
+                        path: proxy.inner().path().to_string(),
+                    }))))
+                } else {
+                    Ok(None)
+                }
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
+    }
+
+    fn bounds(&self) -> Result<(f64, f64, f64, f64), AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<(f64, f64, f64, f64), AutomationError>>,
+            mpsc::Receiver<Result<(f64, f64, f64, f64), AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let component = ComponentProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                let extents = component.get_extents(CoordType::Screen).await?;
+                Ok((
+                    extents.0 as f64,
+                    extents.1 as f64,
+                    extents.2 as f64,
+                    extents.3 as f64,
+                ))
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
+    }
+
+    fn click(&self) -> Result<ClickResult, AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<ClickResult, AutomationError>>,
+            mpsc::Receiver<Result<ClickResult, AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let component = ComponentProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                let extents = component.get_extents(CoordType::Screen).await?;
+                let x = extents.0 + (extents.2 / 2);
+                let y = extents.1 + (extents.3 / 2);
+                let device_controller = DeviceEventControllerProxy::new(&this.connection).await?;
+                device_controller.generate_mouse_event(x, y, "b1p").await?;
+                device_controller.generate_mouse_event(x, y, "b1r").await?;
+                Ok(ClickResult {
+                    method: "click".to_string(),
+                    coordinates: Some((x as f64, y as f64)),
+                    details: format!("Clicked at ({}, {})", x, y),
+                })
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
+    }
+
+    fn double_click(&self) -> Result<ClickResult, AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<ClickResult, AutomationError>>,
+            mpsc::Receiver<Result<ClickResult, AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let component = ComponentProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                let extents = component.get_extents(CoordType::Screen).await?;
+                let x = extents.0 + (extents.2 / 2);
+                let y = extents.1 + (extents.3 / 2);
+                let device_controller = DeviceEventControllerProxy::new(&this.connection).await?;
+                device_controller.generate_mouse_event(x, y, "b1p").await?;
+                device_controller.generate_mouse_event(x, y, "b1c").await?;
+                device_controller.generate_mouse_event(x, y, "b1c").await?;
+                device_controller.generate_mouse_event(x, y, "b1r").await?;
+                Ok(ClickResult {
+                    method: "double_click".to_string(),
+                    coordinates: Some((x as f64, y as f64)),
+                    details: format!("Double clicked at ({}, {})", x, y),
+                })
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
+    }
+
+    fn right_click(&self) -> Result<(), AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<(), AutomationError>>,
+            mpsc::Receiver<Result<(), AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let component = ComponentProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                let extents = component.get_extents(CoordType::Screen).await?;
+                let x = extents.0 + (extents.2 / 2);
+                let y = extents.1 + (extents.3 / 2);
+                let device_controller = DeviceEventControllerProxy::new(&this.connection).await?;
+                device_controller.generate_mouse_event(x, y, "b3p").await?;
+                device_controller.generate_mouse_event(x, y, "b3r").await?;
+                Ok(())
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
+    }
+
+    fn hover(&self) -> Result<(), AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<(), AutomationError>>,
+            mpsc::Receiver<Result<(), AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let component = ComponentProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                let extents = component.get_extents(CoordType::Screen).await?;
+                let x = extents.0 + (extents.2 / 2);
+                let y = extents.1 + (extents.3 / 2);
+                let device_controller = DeviceEventControllerProxy::new(&this.connection).await?;
+                device_controller.generate_mouse_event(x, y, "abs").await?;
+                Ok(())
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
+    }
+
+    fn focus(&self) -> Result<(), AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<(), AutomationError>>,
+            mpsc::Receiver<Result<(), AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let proxy = AccessibleProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                let states = proxy.get_state().await?;
+                if !states.contains(state::State::Focusable) {
+                    return Err(AutomationError::UnsupportedOperation(
+                        "Element is not focusable".to_string(),
+                    ));
+                }
+                let component = ComponentProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                let focused = component.grab_focus().await?;
+                if !focused {
+                    return Err(AutomationError::UnsupportedOperation(
+                        "Failed to focus element".to_string(),
+                    ));
+                }
+                Ok(())
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
+    }
+
+    fn type_text(&self, text: &str, _use_clipboard: bool) -> Result<(), AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<(), AutomationError>>,
+            mpsc::Receiver<Result<(), AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        let text = text.to_string();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let proxy = AccessibleProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                let states = proxy.get_state().await?;
+                if !states.contains(state::State::Focusable) {
+                    return Err(AutomationError::UnsupportedOperation(
+                        "Element is not focusable".to_string(),
+                    ));
+                }
+                let device_controller = DeviceEventControllerProxy::new(&this.connection).await?;
+                device_controller
+                    .generate_keyboard_event(0, "", KeySynthType::Press)
+                    .await?;
+                device_controller
+                    .generate_keyboard_event(0, "", KeySynthType::Release)
+                    .await?;
+                if let Ok(text_proxy) = TextProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await
+                {
+                    let char_count = text_proxy.character_count().await?;
+                    text_proxy.get_text(0, char_count).await?;
+                    text_proxy.get_text(0, text.len() as i32).await?;
+                    Ok(())
+                } else {
+                    for c in text.chars() {
+                        device_controller
+                            .generate_keyboard_event(c as i32, &c.to_string(), KeySynthType::String)
+                            .await?;
+                    }
+                    Ok(())
+                }
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
+    }
+
+    fn press_key(&self, key: &str) -> Result<(), AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<(), AutomationError>>,
+            mpsc::Receiver<Result<(), AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        let key = key.to_string();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let proxy = AccessibleProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())
+                    .map_err(|_| AutomationError::PlatformError("No destination".to_string()))?
+                    .path(this.path.as_str())
+                    .map_err(|_| AutomationError::PlatformError("No path".to_string()))?
+                    .build()
+                    .await?;
+                let keysym = match key.to_lowercase().as_str() {
+                    "enter" => 0xff0d,
+                    "tab" => 0xff09,
+                    "space" => 0x020,
+                    "backspace" => 0xff08,
+                    "delete" => 0xffff,
+                    "escape" => 0xff1b,
+                    "up" => 0xff52,
+                    "down" => 0xff54,
+                    "left" => 0xff51,
+                    "right" => 0xff53,
+                    _ => key.chars().next().map(|c| c as i32).unwrap_or(0),
+                };
+                let device_controller = DeviceEventControllerProxy::new(&this.connection).await?;
+                device_controller
+                    .generate_keyboard_event(keysym, "", KeySynthType::Press)
+                    .await?;
+                device_controller
+                    .generate_keyboard_event(keysym, "", KeySynthType::Release)
+                    .await?;
+                Ok(())
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
+    }
+
+    fn mouse_click_and_hold(&self, x: f64, y: f64) -> Result<(), AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<(), AutomationError>>,
+            mpsc::Receiver<Result<(), AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let component = ComponentProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                let extents = component.get_extents(CoordType::Screen).await?;
+                let abs_x = (extents.0 as f64 + x) as i32;
+                let abs_y = (extents.1 as f64 + y) as i32;
+                let device_controller = DeviceEventControllerProxy::new(&this.connection).await?;
+                device_controller
+                    .generate_mouse_event(abs_x, abs_y, "b1p")
+                    .await?;
+                Ok(())
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
+    }
+
+    fn mouse_move(&self, x: f64, y: f64) -> Result<(), AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<(), AutomationError>>,
+            mpsc::Receiver<Result<(), AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let component = ComponentProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                let extents = component.get_extents(CoordType::Screen).await?;
+                let abs_x = (extents.0 as f64 + x) as i32;
+                let abs_y = (extents.1 as f64 + y) as i32;
+                let device_controller = DeviceEventControllerProxy::new(&this.connection).await?;
+                device_controller
+                    .generate_mouse_event(abs_x, abs_y, "abs")
+                    .await?;
+                Ok(())
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
+    }
+
+    fn mouse_release(&self) -> Result<(), AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<(), AutomationError>>,
+            mpsc::Receiver<Result<(), AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let component = ComponentProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                let extents = component.get_extents(CoordType::Screen).await?;
+                let device_controller = DeviceEventControllerProxy::new(&this.connection).await?;
+                device_controller
+                    .generate_mouse_event(extents.0, extents.1, "b1r")
+                    .await?;
+                Ok(())
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
+    }
+
+    fn mouse_drag(
         &self,
-        _selector: &Selector,
-        _root: Option<&UIElement>,
-        _timeout: Option<Duration>,
-    ) -> Result<UIElement, AutomationError> {
+        _start_x: f64,
+        _start_y: f64,
+        _end_x: f64,
+        _end_y: f64,
+    ) -> Result<(), AutomationError> {
         Err(AutomationError::UnsupportedPlatform(
             "Linux implementation is not yet available".to_string(),
         ))
     }
 
-    fn find_elements(
-        &self,
-        _selector: &Selector,
-        _root: Option<&UIElement>,
-        _timeout: Option<Duration>,
-        _depth: Option<usize>,
-    ) -> Result<Vec<UIElement>, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
+    fn get_text(&self, _max_depth: usize) -> Result<String, AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<String, AutomationError>>,
+            mpsc::Receiver<Result<String, AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let text_proxy = TextProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                let char_count = text_proxy.character_count().await?;
+                Ok(text_proxy.get_text(0, char_count).await?)
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
     }
 
-    fn get_window_tree_by_pid_and_title(&self, _pid: u32, _title: Option<&str>) -> Result<crate::UINode, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
+    fn is_keyboard_focusable(&self) -> Result<bool, AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<bool, AutomationError>>,
+            mpsc::Receiver<Result<bool, AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let proxy = AccessibleProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                let states = proxy.get_state().await?;
+                Ok(states.contains(state::State::Focusable))
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
     }
 
-    fn activate_browser_window_by_title(&self, _title: &str) -> Result<(), AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    fn activate_application(&self, _app_name: &str) -> Result<(), AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    async fn run_command(
-        &self,
-        _windows_command: Option<&str>,
-        _unix_command: Option<&str>,
-    ) -> Result<crate::CommandOutput, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    async fn capture_screen(&self) -> Result<ScreenshotResult, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    async fn capture_monitor_by_name(&self, _name: &str) -> Result<ScreenshotResult, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
+    fn perform_action(&self, action: &str) -> Result<(), AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<(), AutomationError>>,
+            mpsc::Receiver<Result<(), AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        let action = action.to_string();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let action_proxy = ActionProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                let actions = action_proxy.get_actions().await?;
+                if let Some(action_index) = actions.iter().position(|a| a.name == action) {
+                    action_proxy.do_action(action_index as i32).await?;
+                    Ok(())
+                } else {
+                    Err(AutomationError::UnsupportedOperation(format!(
+                        "Action '{}' not supported for this element",
+                        action
+                    )))
+                }
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
-    fn enable_background_cache_warmer(
-        &self,
-        _enable: bool,
-        _interval_seconds: Option<u64>,
-        _max_apps_to_cache: Option<usize>,
-    ) -> Result<(), AutomationError> {
-        Err(AutomationError::UnsupportedOperation(
-            "Background cache warming is not yet implemented for Linux".to_string()
-        ))
-    }
-
-    fn is_cache_warmer_enabled(&self) -> bool {
-        false
-    }
-}
-
-// Placeholder LinuxUIElement that implements UIElementImpl
-pub struct LinuxUIElement;
-
-impl Debug for LinuxUIElement {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LinuxUIElement").finish()
-    }
-}
-
-impl UIElementImpl for LinuxUIElement {
-    fn object_id(&self) -> usize {
-        0
-    }
-
-    fn id(&self) -> Option<String> {
-        None
-    }
-
-    fn role(&self) -> String {
-        "".to_string()
-    }
-
-    fn attributes(&self) -> UIElementAttributes {
-        UIElementAttributes {
-            role: "".to_string(),
-            ..Default::default()
-        }
-    }
-
-    fn name(&self) -> Option<String> {
-        None
-    }
-
-    fn children(&self) -> Result<Vec<UIElement>, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    fn parent(&self) -> Result<Option<UIElement>, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    fn bounds(&self) -> Result<(f64, f64, f64, f64), AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    fn click(&self) -> Result<ClickResult, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    fn double_click(&self) -> Result<ClickResult, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    fn right_click(&self) -> Result<(), AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    fn hover(&self) -> Result<(), AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    fn focus(&self) -> Result<(), AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    fn type_text(&self, _text: &str, _use_clipboard: bool) -> Result<(), AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    fn press_key(&self, _key: &str) -> Result<(), AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    fn get_text(&self, max_depth: usize) -> Result<String, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    fn set_value(&self, _value: &str) -> Result<(), AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    fn is_enabled(&self) -> Result<bool, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    fn is_visible(&self) -> Result<bool, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    fn is_focused(&self) -> Result<bool, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    fn perform_action(&self, _action: &str) -> Result<(), AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    fn create_locator(&self, _selector: Selector) -> Result<Locator, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
-    }
-
-    fn clone_box(&self) -> Box<dyn UIElementImpl> {
-        Box::new(LinuxUIElement)
+    fn create_locator(&self, selector: Selector) -> Result<Locator, AutomationError> {
+        // Create a new LinuxEngine instance (with default args)
+        let engine = LinuxEngine::new(false, false)?;
+        // Wrap self as a UIElement
+        let self_element = UIElement::new(Box::new(self.clone()));
+        // Create a locator for the selector with the engine, then set root to this element
+        let locator = Locator::new(std::sync::Arc::new(engine), selector).within(self_element);
+        Ok(locator)
     }
 
     fn scroll(&self, _direction: &str, _amount: f64) -> Result<(), AutomationError> {
@@ -393,9 +1972,33 @@ impl UIElementImpl for LinuxUIElement {
     }
 
     fn application(&self) -> Result<Option<UIElement>, AutomationError> {
-        Err(AutomationError::UnsupportedPlatform(
-            "Linux implementation is not yet available".to_string(),
-        ))
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<Option<UIElement>, AutomationError>>,
+            mpsc::Receiver<Result<Option<UIElement>, AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let proxy = AccessibleProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                if let Ok(application) = proxy.get_application().await {
+                    Ok(Some(UIElement::new(Box::new(LinuxUIElement {
+                        connection: std::sync::Arc::clone(&this.connection),
+                        destination: application.name.to_string(),
+                        path: application.path.to_string(),
+                    }))))
+                } else {
+                    Ok(None)
+                }
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
     }
 
     fn window(&self) -> Result<Option<UIElement>, AutomationError> {
@@ -404,15 +2007,213 @@ impl UIElementImpl for LinuxUIElement {
         ))
     }
 
-    fn highlight(&self, color: Option<u32>, duration: Option<std::time::Duration>) -> Result<(), AutomationError> {
+    fn highlight(
+        &self,
+        _color: Option<u32>,
+        _duration: Option<std::time::Duration>,
+    ) -> Result<(), AutomationError> {
         Err(AutomationError::UnsupportedPlatform(
             "Linux implementation is not yet available".to_string(),
         ))
+    }
+
+    fn activate_window(&self) -> Result<(), AutomationError> {
+        Err(AutomationError::UnsupportedPlatform(
+            "Linux implementation is not yet available".to_string(),
+        ))
+    }
+
+    fn process_id(&self) -> Result<u32, AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<u32, AutomationError>>,
+            mpsc::Receiver<Result<u32, AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let proxy = AccessibleProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                if let Ok(application) = proxy.get_application().await {
+                    let dbus_proxy = DBusProxy::new(&this.connection).await?;
+                    if let Ok(unique_name) =
+                        dbus_proxy.get_name_owner((&application.name).into()).await
+                    {
+                        if let Ok(pid) = dbus_proxy
+                            .get_connection_unix_process_id(unique_name.into())
+                            .await
+                        {
+                            return Ok(pid);
+                        }
+                    }
+                }
+                Err(AutomationError::PlatformError(format!(
+                    "Failed to get process ID for application: {}",
+                    this.destination
+                )))
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
+    }
+
+    fn clone_box(&self) -> Box<dyn UIElementImpl> {
+        Box::new(LinuxUIElement {
+            connection: Arc::clone(&self.connection),
+            destination: self.destination.clone(),
+            path: self.path.clone(),
+        })
+    }
+
+    fn is_enabled(&self) -> Result<bool, AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<bool, AutomationError>>,
+            mpsc::Receiver<Result<bool, AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let proxy = AccessibleProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                let states = proxy.get_state().await?;
+                Ok(states.contains(state::State::Enabled))
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
+    }
+
+    fn is_visible(&self) -> Result<bool, AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<bool, AutomationError>>,
+            mpsc::Receiver<Result<bool, AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let proxy = AccessibleProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                let states = proxy.get_state().await?;
+                Ok(states.contains(state::State::Visible))
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
+    }
+
+    fn is_focused(&self) -> Result<bool, AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<bool, AutomationError>>,
+            mpsc::Receiver<Result<bool, AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let proxy = AccessibleProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                let states = proxy.get_state().await?;
+                Ok(states.contains(state::State::Focused))
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
+    }
+
+    fn set_value(&self, value: &str) -> Result<(), AutomationError> {
+        use std::sync::mpsc;
+        let (resp_tx, resp_rx): (
+            mpsc::Sender<Result<(), AutomationError>>,
+            mpsc::Receiver<Result<(), AutomationError>>,
+        ) = mpsc::channel();
+        let this = self.clone();
+        let value = value.to_string();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async move {
+                let proxy = AccessibleProxy::builder(&this.connection)
+                    .destination(this.destination.as_str())?
+                    .path(this.path.as_str())?
+                    .build()
+                    .await?;
+                let states = proxy.get_state().await?;
+                if !states.contains(state::State::Focusable) {
+                    return Err(AutomationError::UnsupportedOperation(
+                        "Element is not focusable".to_string(),
+                    ));
+                }
+                let device_controller = DeviceEventControllerProxy::new(&this.connection).await?;
+                device_controller
+                    .generate_keyboard_event(0, "", KeySynthType::Press)
+                    .await?;
+                device_controller
+                    .generate_keyboard_event(0, "", KeySynthType::Release)
+                    .await?;
+                for c in value.chars() {
+                    device_controller
+                        .generate_keyboard_event(c as i32, &c.to_string(), KeySynthType::String)
+                        .await
+                        .map_err(|e: zbus::Error| AutomationError::PlatformError(e.to_string()))?;
+                }
+                Ok(())
+            });
+            let _ = resp_tx.send(result);
+        });
+        resp_rx.recv().unwrap()
     }
 
     fn capture(&self) -> Result<ScreenshotResult, AutomationError> {
         Err(AutomationError::UnsupportedPlatform(
             "Linux implementation is not yet available".to_string(),
         ))
+    }
+
+    fn close(&self) -> Result<(), AutomationError> {
+        Err(AutomationError::UnsupportedPlatform(
+            "Linux implementation is not yet available".to_string(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_linux_engine_creation() {
+        let engine_result = LinuxEngine::new(false, false);
+        assert!(
+            engine_result.is_ok(),
+            "Should be able to create Linux engine"
+        );
+
+        if let Ok(engine) = engine_result {
+            let root = engine.get_root_element();
+            assert!(root.id().is_some(), "Root element should have an ID");
+            assert_eq!(
+                root.role(),
+                "desktop frame",
+                "Root element should have 'desktop frame' role"
+            );
+        }
     }
 }

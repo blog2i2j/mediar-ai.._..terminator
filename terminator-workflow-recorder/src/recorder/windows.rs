@@ -5,7 +5,6 @@ use crate::{
 };
 use arboard::Clipboard;
 use rdev::{Button, EventType, Key};
-use regex::Regex;
 use std::{
     collections::HashMap,
     sync::atomic::{AtomicBool, Ordering},
@@ -64,7 +63,6 @@ struct ModifierStates {
 
 #[derive(Debug, Clone)]
 struct HotkeyPattern {
-    pattern: Regex,
     action: String,
     keys: Vec<u32>,
 }
@@ -138,47 +136,38 @@ impl WindowsRecorder {
     fn initialize_hotkey_patterns() -> Vec<HotkeyPattern> {
         vec![
             HotkeyPattern {
-                pattern: Regex::new(r"Ctrl\+C").unwrap(),
                 action: "Copy".to_string(),
                 keys: vec![162, 67], // Ctrl + C
             },
             HotkeyPattern {
-                pattern: Regex::new(r"Ctrl\+V").unwrap(),
                 action: "Paste".to_string(),
                 keys: vec![162, 86], // Ctrl + V
             },
             HotkeyPattern {
-                pattern: Regex::new(r"Ctrl\+X").unwrap(),
                 action: "Cut".to_string(),
                 keys: vec![162, 88], // Ctrl + X
             },
             HotkeyPattern {
-                pattern: Regex::new(r"Ctrl\+Z").unwrap(),
                 action: "Undo".to_string(),
                 keys: vec![162, 90], // Ctrl + Z
             },
             HotkeyPattern {
-                pattern: Regex::new(r"Ctrl\+Y").unwrap(),
                 action: "Redo".to_string(),
                 keys: vec![162, 89], // Ctrl + Y
             },
             HotkeyPattern {
-                pattern: Regex::new(r"Ctrl\+S").unwrap(),
                 action: "Save".to_string(),
                 keys: vec![162, 83], // Ctrl + S
             },
             HotkeyPattern {
-                pattern: Regex::new(r"Alt\+Tab").unwrap(),
                 action: "Switch Window".to_string(),
                 keys: vec![164, 9], // Alt + Tab
             },
             HotkeyPattern {
-                pattern: Regex::new(r"Win\+D").unwrap(),
                 action: "Show Desktop".to_string(),
                 keys: vec![91, 68], // Win + D
             },
             HotkeyPattern {
-                pattern: Regex::new(r"Ctrl\+Shift\+Esc").unwrap(),
                 action: "Task Manager".to_string(),
                 keys: vec![162, 160, 27], // Ctrl + Shift + Esc
             },
@@ -1018,24 +1007,20 @@ impl WindowsRecorder {
     fn should_ignore_focus_event(
         element_name: &str,
         ui_element: &Option<UIElement>,
-        ignore_patterns: &[String],
-        ignore_window_titles: &[String],
-        ignore_applications: &[String],
+        ignore_patterns: &std::collections::HashSet<String>,
+        ignore_window_titles: &std::collections::HashSet<String>,
+        ignore_applications: &std::collections::HashSet<String>,
     ) -> bool {
         let element_name_lower = element_name.to_lowercase();
 
         // Check against focus-specific ignore patterns
-        for pattern in ignore_patterns {
-            if element_name_lower.contains(&pattern.to_lowercase()) {
-                return true;
-            }
+        if ignore_patterns.iter().any(|pattern| element_name_lower.contains(pattern)) {
+            return true;
         }
 
         // Check against window title patterns
-        for title in ignore_window_titles {
-            if element_name_lower.contains(&title.to_lowercase()) {
-                return true;
-            }
+        if ignore_window_titles.iter().any(|title| element_name_lower.contains(title)) {
+            return true;
         }
 
         // Check against application patterns
@@ -1043,31 +1028,9 @@ impl WindowsRecorder {
             let app_name = ui_elem.application_name();
             if !app_name.is_empty() {
                 let app_name_lower = app_name.to_lowercase();
-                for app in ignore_applications {
-                    if app_name_lower.contains(&app.to_lowercase()) {
-                        return true;
-                    }
+                if ignore_applications.iter().any(|app| app_name_lower.contains(app)) {
+                    return true;
                 }
-            }
-        }
-
-        // Check for common system UI elements that are typically noise
-        let common_ignore_patterns = [
-            "clock",
-            "notification",
-            "taskbar",
-            "start button",
-            "system tray",
-            "search",
-            "cortana",
-            "action center",
-            "windows security",
-            "microsoft edge webview2",
-        ];
-
-        for pattern in &common_ignore_patterns {
-            if element_name_lower.contains(pattern) {
-                return true;
             }
         }
 
@@ -1079,27 +1042,21 @@ impl WindowsRecorder {
         element_name: &str,
         property_name: &str,
         ui_element: &Option<UIElement>,
-        ignore_patterns: &[String],
-        ignore_window_titles: &[String],
-        ignore_applications: &[String],
+        ignore_patterns: &std::collections::HashSet<String>,
+        ignore_window_titles: &std::collections::HashSet<String>,
+        ignore_applications: &std::collections::HashSet<String>,
     ) -> bool {
         let element_name_lower = element_name.to_lowercase();
         let property_name_lower = property_name.to_lowercase();
 
         // Check against property-specific ignore patterns
-        for pattern in ignore_patterns {
-            if element_name_lower.contains(&pattern.to_lowercase())
-                || property_name_lower.contains(&pattern.to_lowercase())
-            {
-                return true;
-            }
+        if ignore_patterns.iter().any(|pattern| element_name_lower.contains(pattern) || property_name_lower.contains(pattern)) {
+            return true;
         }
 
         // Check against window title patterns
-        for title in ignore_window_titles {
-            if element_name_lower.contains(&title.to_lowercase()) {
-                return true;
-            }
+        if ignore_window_titles.iter().any(|title| element_name_lower.contains(title)) {
+            return true;
         }
 
         // Check against application patterns
@@ -1107,31 +1064,9 @@ impl WindowsRecorder {
             let app_name = ui_elem.application_name();
             if !app_name.is_empty() {
                 let app_name_lower = app_name.to_lowercase();
-                for app in ignore_applications {
-                    if app_name_lower.contains(&app.to_lowercase()) {
-                        return true;
-                    }
+                if ignore_applications.iter().any(|app| app_name_lower.contains(app)) {
+                    return true;
                 }
-            }
-        }
-
-        // Check for common system UI elements that are typically noise
-        let common_ignore_patterns = [
-            "clock",
-            "notification",
-            "taskbar",
-            "start button",
-            "system tray",
-            "search",
-            "cortana",
-            "action center",
-            "windows security",
-            "microsoft edge webview2",
-        ];
-
-        for pattern in &common_ignore_patterns {
-            if element_name_lower.contains(pattern) {
-                return true;
             }
         }
 

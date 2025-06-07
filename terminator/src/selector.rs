@@ -13,7 +13,7 @@ pub enum Selector {
     Text(String),
     /// Select using XPath-like query
     Path(String),
-    /// Select by using Native Automation id, (eg: `AutomationID` for windows)
+    /// Select by using Native Automation id, (eg: `AutomationID` for windows) and for linux it is Id value in Attributes
     NativeId(String),
     /// Select by multiple attributes (key-value pairs)
     Attributes(BTreeMap<String, String>),
