@@ -1,0 +1,92 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Terminator Development Standards
+
+## Code Quality (Non-Negotiable)
+```bash
+cargo fmt --check    # Must pass - zero tolerance for unformatted code
+cargo clippy         # Fix ALL warnings - use #[allow] only with justification  
+cargo test           # All tests must pass
+```
+
+## Architecture
+- **Core**: Rust in **[terminator/src/](mdc:terminator/src)** with platform traits in **[platforms/mod.rs](mdc:terminator/src/platforms/mod.rs)**
+- **Bindings**: Python (**[bindings/python/](mdc:bindings/python)**) and Node.js (**[bindings/nodejs/](mdc:bindings/nodejs)**) wrap Rust core
+- **Examples**: **[examples/](mdc:examples)** serve as integration tests - keep simple, one concept each
+
+## API Design
+```rust
+// ✅ Good: Async, chainable, type-safe
+let monitor = desktop.get_primary_monitor().await?;
+let screenshot = desktop.capture_monitor(&monitor).await?;
+
+// ✅ Good: Rich error context
+.map_err(|e| AutomationError::PlatformError(format!("Failed to capture {}: {}", id, e)))
+
+// ✅ Good: Full documentation
+/// Capture monitor screenshot
+/// 
+/// # Examples
+/// ```rust
+/// let desktop = Desktop::new_default()?;
+/// let screenshot = desktop.capture_monitor(&monitor).await?;
+/// ```
+#[instrument(skip(self))]
+pub async fn capture_monitor(&self, monitor: &Monitor) -> Result<ScreenshotResult, AutomationError>
+```
+
+## Platform Code
+```rust
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::Accessibility::*;
+
+#[cfg(target_os = "macos")]  
+use accessibility::*;
+
+#[cfg(target_os = "linux")]
+use atspi::*;
+```
+
+## Development Loop
+```bash
+# Fast iteration
+cargo check && cargo clippy && cargo test
+
+# With bindings  
+TERMINATOR_BUILD_BINDINGS=1 cargo build --release
+
+# Before PR
+cargo fmt && cargo clippy -- -D warnings && cargo test
+```
+
+## Performance Targets
+- UI scans: <80ms
+- Screenshots: <200ms  
+- Memory: <50MB baseline
+- Use `Arc<dyn Trait>`, `#[instrument]`, profile with `criterion`
+
+## Dependencies
+- Use `workspace = true` in **[Cargo.toml](mdc:Cargo.toml)**
+- Platform deps: `optional = true` + `#[cfg]`
+- Minimize external deps, justify additions
+
+## Testing
+- Unit tests (80%): Fast, isolated
+- Integration tests (15%): Component interaction
+- Examples (5%): Real-world scenarios
+- Test error cases, not just happy paths
+
+## PR Requirements
+- Video demo for UI changes (Cap.so/Screen.studio)
+- Tests pass on all platforms
+- Documentation updated
+- Example added for new features
+- Breaking changes documented
+
+## Language Bindings
+- **Python**: PyO3, snake_case, type stubs, docstrings
+- **Node.js**: napi-rs, camelCase, TypeScript defs, JSDoc
+

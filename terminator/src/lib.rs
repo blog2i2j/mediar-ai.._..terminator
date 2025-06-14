@@ -3,11 +3,10 @@
 //! This module provides a cross-platform API for automating desktop applications
 //! through accessibility APIs, inspired by Playwright's web automation model.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use std::fmt;
 use serde::{Deserialize, Serialize};
-use tracing::{info, instrument, warn};
+use std::fmt;
+use std::sync::Arc;
+use tracing::{debug, error, instrument};
 
 pub mod element;
 pub mod errors;
@@ -18,7 +17,7 @@ pub mod selector;
 mod tests;
 pub mod utils;
 
-pub use element::{UIElement, UIElementAttributes, SerializableUIElement};
+pub use element::{SerializableUIElement, UIElement, UIElementAttributes};
 pub use errors::AutomationError;
 pub use locator::Locator;
 pub use selector::Selector;
@@ -40,9 +39,54 @@ pub struct CommandOutput {
     pub stderr: String,
 }
 
+/// Represents a monitor/display device
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Monitor {
+    /// Unique identifier for the monitor
+    pub id: String,
+    /// Human-readable name of the monitor
+    pub name: String,
+    /// Whether this is the primary monitor
+    pub is_primary: bool,
+    /// Monitor dimensions
+    pub width: u32,
+    pub height: u32,
+    /// Monitor position (top-left corner)
+    pub x: i32,
+    pub y: i32,
+    /// Scale factor (e.g., 1.0 for 100%, 1.25 for 125%)
+    pub scale_factor: f64,
+}
+
+impl Monitor {
+    /// Capture a screenshot of this monitor
+    #[instrument(skip(self, desktop))]
+    pub async fn capture(&self, desktop: &Desktop) -> Result<ScreenshotResult, AutomationError> {
+        desktop.engine.capture_monitor_by_id(&self.id).await
+    }
+
+    /// Check if this monitor contains the given coordinates
+    pub fn contains_point(&self, x: i32, y: i32) -> bool {
+        x >= self.x
+            && x < self.x + self.width as i32
+            && y >= self.y
+            && y < self.y + self.height as i32
+    }
+
+    /// Get the center point of this monitor
+    pub fn center(&self) -> (i32, i32) {
+        (
+            self.x + self.width as i32 / 2,
+            self.y + self.height as i32 / 2,
+        )
+    }
+}
+
 /// Represents a node in the UI tree, containing its attributes and children.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct UINode {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub attributes: UIElementAttributes,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<UINode>,
@@ -56,22 +100,33 @@ impl fmt::Debug for UINode {
 
 impl UINode {
     /// Helper method for debug formatting with depth control
-    fn debug_with_depth(&self, f: &mut fmt::Formatter<'_>, current_depth: usize, max_depth: usize) -> fmt::Result {
+    fn debug_with_depth(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        current_depth: usize,
+        max_depth: usize,
+    ) -> fmt::Result {
         let mut debug_struct = f.debug_struct("UINode");
         debug_struct.field("attributes", &self.attributes);
-        
+
         if !self.children.is_empty() {
             if current_depth < max_depth {
-                debug_struct.field("children", &DebugChildrenWithDepth {
-                    children: &self.children,
-                    current_depth,
-                    max_depth,
-                });
+                debug_struct.field(
+                    "children",
+                    &DebugChildrenWithDepth {
+                        children: &self.children,
+                        current_depth,
+                        max_depth,
+                    },
+                );
             } else {
-                debug_struct.field("children", &format!("[{} children (depth limit reached)]", self.children.len()));
+                debug_struct.field(
+                    "children",
+                    &format!("[{} children (depth limit reached)]", self.children.len()),
+                );
             }
         }
-        
+
         debug_struct.finish()
     }
 }
@@ -83,10 +138,10 @@ struct DebugChildrenWithDepth<'a> {
     max_depth: usize,
 }
 
-impl<'a> fmt::Debug for DebugChildrenWithDepth<'a> {
+impl fmt::Debug for DebugChildrenWithDepth<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut list = f.debug_list();
-        
+
         // Show ALL children, no limit
         for child in self.children.iter() {
             list.entry(&DebugNodeWithDepth {
@@ -95,7 +150,7 @@ impl<'a> fmt::Debug for DebugChildrenWithDepth<'a> {
                 max_depth: self.max_depth,
             });
         }
-        
+
         list.finish()
     }
 }
@@ -107,9 +162,10 @@ struct DebugNodeWithDepth<'a> {
     max_depth: usize,
 }
 
-impl<'a> fmt::Debug for DebugNodeWithDepth<'a> {
+impl fmt::Debug for DebugNodeWithDepth<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.node.debug_with_depth(f, self.current_depth, self.max_depth)
+        self.node
+            .debug_with_depth(f, self.current_depth, self.max_depth)
     }
 }
 
@@ -122,6 +178,8 @@ pub struct ScreenshotResult {
     pub width: u32,
     /// Height of the image
     pub height: u32,
+    /// Monitor information if captured from a specific monitor
+    pub monitor: Option<Monitor>,
 }
 
 /// The main entry point for UI automation
@@ -131,231 +189,84 @@ pub struct Desktop {
 
 impl Desktop {
     #[instrument(skip(use_background_apps, activate_app))]
-    pub fn new(
-        use_background_apps: bool,
-        activate_app: bool,
-    ) -> Result<Self, AutomationError> {
-        let start = Instant::now();
-        info!("Initializing Desktop automation engine");
-        
+    pub fn new(use_background_apps: bool, activate_app: bool) -> Result<Self, AutomationError> {
         let engine = platforms::create_engine(use_background_apps, activate_app)?;
-        
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            use_background_apps,
-            activate_app,
-            "Desktop automation engine initialized"
-        );
-        
-        Ok(Self {
-            engine: Arc::from(engine),
-        })
+        Ok(Self { engine })
     }
 
-    /// Enable or disable background cache warming for improved performance
-    /// 
-    /// This feature spawns a background thread that periodically builds UI trees for
-    /// frequently used applications, keeping the native platform cache warm.
-    /// This can significantly improve performance when your recorder needs to fetch
-    /// full UI trees for applications.
-    /// 
-    /// # Arguments
-    /// * `enable` - Whether to enable (true) or disable (false) the cache warmer
-    /// * `interval_seconds` - How often to refresh the cache (default: 30 seconds)
-    /// * `max_apps_to_cache` - Maximum number of recent apps to keep cached (default: 10)
-    /// 
-    /// # Example
-    /// ```no_run
+    /// Initializet the desktop without arguments
+    ///
+    /// This is a convenience method that calls `new` with default arguments.
+    ///
+    /// # Examples
+    ///
+    /// ```
     /// use terminator::Desktop;
-    /// 
-    /// let desktop = Desktop::new(false, false)?;
-    /// 
-    /// // Enable cache warming every 60 seconds for up to 15 apps
-    /// desktop.enable_background_cache_warmer(true, Some(60), Some(15))?;
-    /// 
-    /// // Later, disable cache warming
-    /// desktop.enable_background_cache_warmer(false, None, None)?;
+    /// let desktop = Desktop::new_default()?;
     /// # Ok::<(), terminator::AutomationError>(())
     /// ```
-    pub fn enable_background_cache_warmer(
-        &self,
-        enable: bool,
-        interval_seconds: Option<u64>,
-        max_apps_to_cache: Option<usize>,
-    ) -> Result<(), AutomationError> {
-        self.engine.enable_background_cache_warmer(enable, interval_seconds, max_apps_to_cache)
+    pub fn new_default() -> Result<Self, AutomationError> {
+        Self::new(false, false)
     }
 
-    /// Check if the background cache warmer is currently running
-    /// 
-    /// # Returns
-    /// `true` if the cache warmer is active, `false` otherwise
-    pub fn is_cache_warmer_enabled(&self) -> bool {
-        self.engine.is_cache_warmer_enabled()
-    }
-
-    /// Returns the root element of the desktop
-    /// 
-    /// The root element represents the desktop and provides access to all UI elements
-    /// currently visible on the screen.
-    /// 
+    /// Gets the root element representing the entire desktop.
+    ///
+    /// This is the top-level element that contains all applications, windows,
+    /// and UI elements on the desktop. You can use it as a starting point for
+    /// element searches.
+    ///
     /// # Examples
-    /// 
-    /// ```no_run
+    ///
+    /// ```
     /// use terminator::Desktop;
-    /// 
     /// let desktop = Desktop::new(false, false)?;
     /// let root = desktop.root();
-    /// println!("Desktop root: {:?}", root.role());
+    /// println!("Root element ID: {:?}", root.id());
     /// # Ok::<(), terminator::AutomationError>(())
     /// ```
     pub fn root(&self) -> UIElement {
-        let start = Instant::now();
-        info!("Getting root element");
-        
-        let element = self.engine.get_root_element();
-        
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            element_id = element.id().unwrap_or_default(),
-            "Root element retrieved"
-        );
-        
-        element
+        self.engine.get_root_element()
     }
 
     #[instrument(skip(self, selector))]
     pub fn locator(&self, selector: impl Into<Selector>) -> Locator {
-        let start = Instant::now();
         let selector = selector.into();
-        info!(?selector, "Creating locator");
-        
-        let locator = Locator::new(self.engine.clone(), selector);
-        
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            "Locator created"
-        );
-        
-        locator
+        Locator::new(self.engine.clone(), selector)
     }
 
     #[instrument(skip(self))]
     pub fn focused_element(&self) -> Result<UIElement, AutomationError> {
-        let start = Instant::now();
-        info!("Getting focused element");
-        
-        let element = self.engine.get_focused_element()?;
-        
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            element_id = element.id().unwrap_or_default(),
-            "Focused element retrieved"
-        );
-        
-        Ok(element)
+        self.engine.get_focused_element()
     }
 
     #[instrument(skip(self))]
     pub fn applications(&self) -> Result<Vec<UIElement>, AutomationError> {
-        let start = Instant::now();
-        info!("Getting all applications");
-        
-        let apps = self.engine.get_applications()?;
-        
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            app_count = apps.len(),
-            "Applications retrieved"
-        );
-        
-        Ok(apps)
+        self.engine.get_applications()
     }
 
     #[instrument(skip(self, name))]
     pub fn application(&self, name: &str) -> Result<UIElement, AutomationError> {
-        let start = Instant::now();
-        info!(app_name = name, "Getting application by name");
-        
-        let app = self.engine.get_application_by_name(name)?;
-        
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            app_id = app.id().unwrap_or_default(),
-            "Application retrieved"
-        );
-        
-        Ok(app)
+        self.engine.get_application_by_name(name)
     }
 
     #[instrument(skip(self, app_name))]
     pub fn open_application(&self, app_name: &str) -> Result<UIElement, AutomationError> {
-        let start = Instant::now();
-        info!(app_name, "Opening application");
-        
-        let app = self.engine.open_application(app_name)?;
-        
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            "Application opened"
-        );
-        
-        Ok(app)
+        self.engine.open_application(app_name)
     }
 
     #[instrument(skip(self, app_name))]
     pub fn activate_application(&self, app_name: &str) -> Result<(), AutomationError> {
-        let start = Instant::now();
-        info!(app_name, "Activating application");
-        
-        self.engine.activate_application(app_name)?;
-        
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            "Application activated"
-        );
-        
-        Ok(())
+        self.engine.activate_application(app_name)
     }
 
     #[instrument(skip(self, url, browser))]
-    pub fn open_url(&self, url: &str, browser: Option<&str>) -> Result<(), AutomationError> {
-        let start = Instant::now();
-        info!(url, ?browser, "Opening URL");
-        
-        self.engine.open_url(url, browser)?;
-        
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            "URL opened"
-        );
-        
-        Ok(())
+    pub fn open_url(&self, url: &str, browser: Option<&str>) -> Result<UIElement, AutomationError> {
+        self.engine.open_url(url, browser)
     }
 
     #[instrument(skip(self, file_path))]
     pub fn open_file(&self, file_path: &str) -> Result<(), AutomationError> {
-        let start = Instant::now();
-        info!(file_path, "Opening file");
-        
-        self.engine.open_file(file_path)?;
-        
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            "File opened"
-        );
-        
-        Ok(())
+        self.engine.open_file(file_path)
     }
 
     #[instrument(skip(self, windows_command, unix_command))]
@@ -364,103 +275,236 @@ impl Desktop {
         windows_command: Option<&str>,
         unix_command: Option<&str>,
     ) -> Result<CommandOutput, AutomationError> {
-        let start = Instant::now();
-        info!(?windows_command, ?unix_command, "Running command");
-        
-        let output = self.engine.run_command(windows_command, unix_command).await?;
-        
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            exit_code = output.exit_status,
-            stdout_len = output.stdout.len(),
-            stderr_len = output.stderr.len(),
-            "Command completed"
-        );
-        
-        Ok(output)
+        self.engine.run_command(windows_command, unix_command).await
     }
 
+    // ============== NEW MONITOR ABSTRACTIONS ==============
+
+    /// List all available monitors/displays
+    ///
+    /// Returns a vector of Monitor structs containing information about each display,
+    /// including dimensions, position, scale factor, and whether it's the primary monitor.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use terminator::Desktop;
+    /// let desktop = Desktop::new_default()?;
+    /// let monitors = desktop.list_monitors().await?;
+    /// for monitor in monitors {
+    ///     println!("Monitor: {} ({}x{})", monitor.name, monitor.width, monitor.height);
+    /// }
+    /// # Ok::<(), terminator::AutomationError>(())
+    /// ```
+    #[instrument(skip(self))]
+    pub async fn list_monitors(&self) -> Result<Vec<Monitor>, AutomationError> {
+        self.engine.list_monitors().await
+    }
+
+    /// Get the primary monitor
+    ///
+    /// Returns the monitor marked as primary in the system settings.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use terminator::Desktop;
+    /// let desktop = Desktop::new_default()?;
+    /// let primary = desktop.get_primary_monitor().await?;
+    /// println!("Primary monitor: {}", primary.name);
+    /// # Ok::<(), terminator::AutomationError>(())
+    /// ```
+    #[instrument(skip(self))]
+    pub async fn get_primary_monitor(&self) -> Result<Monitor, AutomationError> {
+        self.engine.get_primary_monitor().await
+    }
+
+    /// Get the monitor containing the currently focused window
+    ///
+    /// Returns the monitor that contains the currently active/focused window.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use terminator::Desktop;
+    /// let desktop = Desktop::new_default()?;
+    /// let active = desktop.get_active_monitor().await?;
+    /// println!("Active monitor: {}", active.name);
+    /// # Ok::<(), terminator::AutomationError>(())
+    /// ```
+    #[instrument(skip(self))]
+    pub async fn get_active_monitor(&self) -> Result<Monitor, AutomationError> {
+        self.engine.get_active_monitor().await
+    }
+
+    /// Get a monitor by its ID
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use terminator::Desktop;
+    /// let desktop = Desktop::new_default()?;
+    /// let monitor = desktop.get_monitor_by_id("monitor_id").await?;
+    /// # Ok::<(), terminator::AutomationError>(())
+    /// ```
+    #[instrument(skip(self, id))]
+    pub async fn get_monitor_by_id(&self, id: &str) -> Result<Monitor, AutomationError> {
+        self.engine.get_monitor_by_id(id).await
+    }
+
+    /// Get a monitor by its name
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use terminator::Desktop;
+    /// let desktop = Desktop::new_default()?;
+    /// let monitor = desktop.get_monitor_by_name("Dell Monitor").await?;
+    /// # Ok::<(), terminator::AutomationError>(())
+    /// ```
+    #[instrument(skip(self, name))]
+    pub async fn get_monitor_by_name(&self, name: &str) -> Result<Monitor, AutomationError> {
+        self.engine.get_monitor_by_name(name).await
+    }
+
+    /// Capture a screenshot of a specific monitor
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use terminator::Desktop;
+    /// let desktop = Desktop::new_default()?;
+    /// let monitor = desktop.get_primary_monitor().await?;
+    /// let screenshot = desktop.capture_monitor(&monitor).await?;
+    /// # Ok::<(), terminator::AutomationError>(())
+    /// ```
+    #[instrument(skip(self, monitor))]
+    pub async fn capture_monitor(
+        &self,
+        monitor: &Monitor,
+    ) -> Result<ScreenshotResult, AutomationError> {
+        let mut result = self.engine.capture_monitor_by_id(&monitor.id).await?;
+        result.monitor = Some(monitor.clone());
+        Ok(result)
+    }
+
+    /// Capture screenshots of all monitors
+    ///
+    /// Returns a vector of (Monitor, ScreenshotResult) pairs for each display.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use terminator::Desktop;
+    /// let desktop = Desktop::new_default()?;
+    /// let screenshots = desktop.capture_all_monitors().await?;
+    /// for (monitor, screenshot) in screenshots {
+    ///     println!("Captured monitor: {} ({}x{})", monitor.name, screenshot.width, screenshot.height);
+    /// }
+    /// # Ok::<(), terminator::AutomationError>(())
+    /// ```
+    #[instrument(skip(self))]
+    pub async fn capture_all_monitors(
+        &self,
+    ) -> Result<Vec<(Monitor, ScreenshotResult)>, AutomationError> {
+        let monitors = self.list_monitors().await?;
+        let mut results = Vec::new();
+
+        for monitor in monitors {
+            match self.capture_monitor(&monitor).await {
+                Ok(screenshot) => results.push((monitor, screenshot)),
+                Err(e) => {
+                    error!("Failed to capture monitor {}: {}", monitor.name, e);
+                    // Continue with other monitors rather than failing completely
+                }
+            }
+        }
+
+        if results.is_empty() {
+            return Err(AutomationError::PlatformError(
+                "Failed to capture any monitors".to_string(),
+            ));
+        }
+
+        Ok(results)
+    }
+
+    // ============== DEPRECATED METHODS ==============
+
+    /// Capture a screenshot of the primary monitor
+    ///
+    /// # Deprecated
+    ///
+    /// Use [`Desktop::get_primary_monitor`] and [`Desktop::capture_monitor`] instead:
+    ///
+    /// ```
+    /// use terminator::Desktop;
+    /// let desktop = Desktop::new_default()?;
+    /// let primary = desktop.get_primary_monitor().await?;
+    /// let screenshot = desktop.capture_monitor(&primary).await?;
+    /// # Ok::<(), terminator::AutomationError>(())
+    /// ```
+    #[deprecated(
+        since = "0.4.9",
+        note = "Use get_primary_monitor() and capture_monitor() instead"
+    )]
     #[instrument(skip(self))]
     pub async fn capture_screen(&self) -> Result<ScreenshotResult, AutomationError> {
-        let start = Instant::now();
-        info!("Capturing screen");
-        
-        let screenshot = self.engine.capture_screen().await?;
-        
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            width = screenshot.width,
-            height = screenshot.height,
-            "Screen captured"
-        );
-        
-        Ok(screenshot)
+        let primary = self.get_primary_monitor().await?;
+        self.capture_monitor(&primary).await
     }
 
+    /// Get the name of the monitor containing the focused window
+    ///
+    /// # Deprecated
+    ///
+    /// Use [`Desktop::get_active_monitor`] instead:
+    ///
+    /// ```
+    /// use terminator::Desktop;
+    /// let desktop = Desktop::new_default()?;
+    /// let active_monitor = desktop.get_active_monitor().await?;
+    /// println!("Active monitor name: {}", active_monitor.name);
+    /// # Ok::<(), terminator::AutomationError>(())
+    /// ```
+    #[deprecated(since = "0.4.9", note = "Use get_active_monitor() instead")]
     #[instrument(skip(self))]
     pub async fn get_active_monitor_name(&self) -> Result<String, AutomationError> {
-        // Get all windows
-        let windows = xcap::Window::all().map_err(|e| {
-            AutomationError::PlatformError(format!("Failed to get windows: {}", e))
-        })?;
-
-        // Find the focused window
-        let focused_window = windows.iter()
-            .find(|w| w.is_focused().unwrap_or(false))
-            .ok_or_else(|| {
-                AutomationError::ElementNotFound("No focused window found".to_string())
-            })?;
-
-        // Get the monitor name for the focused window
-        let monitor = focused_window.current_monitor().map_err(|e| {
-            AutomationError::PlatformError(format!("Failed to get current monitor: {}", e))
-        })?;
-
-        let monitor_name = monitor.name().map_err(|e| {
-            AutomationError::PlatformError(format!("Failed to get monitor name: {}", e))
-        })?;
-
-        Ok(monitor_name)
+        let monitor = self.get_active_monitor().await?;
+        Ok(monitor.name)
     }
 
+    /// Capture a screenshot of a monitor by name
+    ///
+    /// # Deprecated
+    ///
+    /// Use [`Desktop::get_monitor_by_name`] and [`Desktop::capture_monitor`] instead:
+    ///
+    /// ```
+    /// use terminator::Desktop;
+    /// let desktop = Desktop::new_default()?;
+    /// let monitor = desktop.get_monitor_by_name("Monitor Name").await?;
+    /// let screenshot = desktop.capture_monitor(&monitor).await?;
+    /// # Ok::<(), terminator::AutomationError>(())
+    /// ```
+    #[deprecated(
+        since = "0.4.9",
+        note = "Use get_monitor_by_name() and capture_monitor() instead"
+    )]
     #[instrument(skip(self, name))]
     pub async fn capture_monitor_by_name(
         &self,
         name: &str,
     ) -> Result<ScreenshotResult, AutomationError> {
-        let start = Instant::now();
-        info!(monitor_name = name, "Capturing monitor");
-        
-        let screenshot = self.engine.capture_monitor_by_name(name).await?;
-        
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            width = screenshot.width,
-            height = screenshot.height,
-            "Monitor captured"
-        );
-        
-        Ok(screenshot)
+        let monitor = self.get_monitor_by_name(name).await?;
+        self.capture_monitor(&monitor).await
     }
+
+    // ============== END DEPRECATED METHODS ==============
 
     #[instrument(skip(self, image_path))]
     pub async fn ocr_image_path(&self, image_path: &str) -> Result<String, AutomationError> {
-        let start = Instant::now();
-        info!(image_path, "Performing OCR on image file");
-        
-        let text = self.engine.ocr_image_path(image_path).await?;
-        
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            text_length = text.len(),
-            "OCR completed"
-        );
-        
-        Ok(text)
+        self.engine.ocr_image_path(image_path).await
     }
 
     #[instrument(skip(self, screenshot))]
@@ -468,146 +512,94 @@ impl Desktop {
         &self,
         screenshot: &ScreenshotResult,
     ) -> Result<String, AutomationError> {
-        let start = Instant::now();
-        info!(
-            width = screenshot.width,
-            height = screenshot.height,
-            "Performing OCR on screenshot"
-        );
-        
-        let text = self.engine.ocr_screenshot(screenshot).await?;
-        
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            text_length = text.len(),
-            "OCR completed"
-        );
-        
-        Ok(text)
+        self.engine.ocr_screenshot(screenshot).await
     }
 
     #[instrument(skip(self, title))]
     pub fn activate_browser_window_by_title(&self, title: &str) -> Result<(), AutomationError> {
-        let start = Instant::now();
-        info!(title, "Activating browser window");
-        
-        self.engine.activate_browser_window_by_title(title)?;
-        
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            "Browser window activated"
-        );
-        
-        Ok(())
-    }
-
-    #[instrument(skip(self, title_contains, timeout))]
-    pub async fn find_window_by_criteria(
-        &self,
-        title_contains: Option<&str>,
-        timeout: Option<Duration>,
-    ) -> Result<UIElement, AutomationError> {
-        let start = Instant::now();
-        info!(?title_contains, ?timeout, "Finding window by criteria");
-        
-        let window = self.engine.find_window_by_criteria(title_contains, timeout).await?;
-        
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            window_id = window.id().unwrap_or_default(),
-            "Window found"
-        );
-        
-        Ok(window)
+        self.engine.activate_browser_window_by_title(title)
     }
 
     #[instrument(skip(self))]
     pub async fn get_current_browser_window(&self) -> Result<UIElement, AutomationError> {
-        let start = Instant::now();
-        info!("Getting current browser window");
-        
-        let window = self.engine.get_current_browser_window().await?;
-        
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            window_id = window.id().unwrap_or_default(),
-            "Current browser window retrieved"
-        );
-        
-        Ok(window)
+        self.engine.get_current_browser_window().await
     }
 
     #[instrument(skip(self))]
     pub async fn get_current_window(&self) -> Result<UIElement, AutomationError> {
-        let start = Instant::now();
-        info!("Getting current window");
-
-        let window = self.engine.get_current_window().await?;
-
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            window_id = window.id().unwrap_or_default(),
-            "Current window retrieved"
-        );
-
-        Ok(window)
+        self.engine.get_current_window().await
     }
 
     #[instrument(skip(self))]
     pub async fn get_current_application(&self) -> Result<UIElement, AutomationError> {
-        let start = Instant::now();
-        info!("Getting current application");
-
-        let application = self.engine.get_current_application().await?;
-
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            app_id = application.id().unwrap_or_default(),
-            "Current application retrieved"
-        );
-
-        Ok(application)
+        self.engine.get_current_application().await
     }
 
-    #[instrument(skip(self, title))]
-    pub fn get_window_tree_by_title(&self, title: &str) -> Result<UINode, AutomationError> {
-        let start = Instant::now();
-        info!(title, "Getting window tree by title");
-
-        let window_tree_root = self.engine.get_window_tree_by_title(title)?;
-
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            title = title,
-            "Window tree retrieved"
-        );
-
-        Ok(window_tree_root)
+    #[instrument(skip(self, pid, title, config))]
+    pub fn get_window_tree(
+        &self,
+        pid: u32,
+        title: Option<&str>,
+        config: Option<crate::platforms::TreeBuildConfig>,
+    ) -> Result<UINode, AutomationError> {
+        let tree_config = config.unwrap_or_default();
+        self.engine.get_window_tree(pid, title, tree_config)
     }
 
-    #[instrument(skip(self, pid, title))]
-    pub fn get_window_tree_by_pid_and_title(&self, pid: u32, title: Option<&str>) -> Result<UINode, AutomationError> {
-        let start = Instant::now();
-        info!(pid, ?title, "Getting window tree by PID and title");
+    /// Get all window elements for a given application by name
+    #[instrument(skip(self, app_name))]
+    pub async fn windows_for_application(
+        &self,
+        app_name: &str,
+    ) -> Result<Vec<UIElement>, AutomationError> {
+        // 1. Find the application element
+        let app_element = match self.application(app_name) {
+            Ok(app) => app,
+            Err(e) => {
+                error!("Application '{}' not found: {}", app_name, e);
+                return Err(e);
+            }
+        };
 
-        let window_tree_root = self.engine.get_window_tree_by_pid_and_title(pid, title)?;
+        // 2. Get children of the application element
+        let children = match app_element.children() {
+            Ok(ch) => ch,
+            Err(e) => {
+                error!(
+                    "Failed to get children for application '{}': {}",
+                    app_name, e
+                );
+                return Err(e);
+            }
+        };
 
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            pid = pid,
-            ?title,
-            "Window tree retrieved by PID and title"
+        // 3. Filter children to find windows (cross-platform)
+        let windows: Vec<UIElement> = children
+            .into_iter()
+            .filter(|el| {
+                let role = el.role().to_lowercase();
+                #[cfg(target_os = "macos")]
+                {
+                    role == "axwindow" || role == "window"
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    role == "window"
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                {
+                    // Fallback: just look for 'window' role
+                    role == "window"
+                }
+            })
+            .collect();
+
+        debug!(
+            window_count = windows.len(),
+            "Found windows for application '{}'", app_name
         );
 
-        Ok(window_tree_root)
+        Ok(windows)
     }
 }
 
@@ -618,4 +610,3 @@ impl Clone for Desktop {
         }
     }
 }
-

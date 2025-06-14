@@ -1,0 +1,144 @@
+---
+description: When implementing Agentic Experience stuff 
+globs: 
+alwaysApply: false
+---
+# UI Automation Workflow Patterns
+
+## Data Scraping and Table Creation Workflow
+
+### Step-by-Step Process
+1. **Navigate to Data Source**
+   ```rust
+   navigate_browser(url) -> open target page
+   ```
+
+2. **Extract Content**
+   ```rust
+   capture_screen() -> get visual content
+   // OCR is more reliable than parsing complex web UI trees
+   ```
+
+3. **Process Data**
+   - Parse extracted text into structured format
+   - Create tables/JSON from raw text
+   - Clean and format data
+
+4. **Transfer to Target App**
+   ```rust
+   set_clipboard(structured_data) -> copy formatted data
+   get_applications() -> find target app
+   get_window_tree(pid) -> analyze target UI
+   click_element(text_area) -> focus input
+   press_key("Ctrl+V") -> paste data
+   ```
+
+## Element Selection Strategy
+
+### UI Tree Analysis Pattern
+```rust
+get_window_tree(pid) -> {
+    "attributes": {
+        "role": "Document",
+        "name": "Text editor", 
+        "id": "12345"  // <- BEST selector
+    },
+    "children": [...]
+}
+```
+
+### Selector Building Logic
+1. **Look for ID first**: `#12345` (most stable)
+2. **Use name if no ID**: `name:"Text editor"`
+3. **Role as last resort**: `role:"Document"`
+4. **Chain selectors**: `["role:Window", "#12345"]` for nested elements
+
+## Cross-Application Automation
+
+### Browser to Desktop App Pattern
+```rust
+// 1. Extract from browser
+navigate_browser("https://example.com")
+capture_screen() -> ocr_text
+parse_data(ocr_text) -> structured_data
+
+// 2. Transfer to desktop app
+set_clipboard(structured_data)
+get_applications() -> find_notepad
+activate_element(notepad_window)
+click_element(text_area)
+press_key("Ctrl+V")
+```
+
+### Multi-Window Coordination
+```rust
+// Switch between windows efficiently
+get_windows_for_application("Chrome") -> chrome_windows
+get_windows_for_application("Notepad") -> notepad_windows
+activate_element(target_window) -> bring to front
+```
+
+## Error Recovery Patterns
+
+### Validation Before Action
+```rust
+validate_element(selector) -> {
+    "exists": true,
+    "visible": true,
+    "enabled": true
+}
+// Only proceed if validation passes
+```
+
+### Retry Logic
+```rust
+// Implement retries for flaky elements
+for attempt in 1..=3 {
+    if validate_element(selector).exists {
+        break;
+    }
+    wait(1000ms);
+}
+```
+
+### Visual Debugging
+```rust
+highlight_element(selector) -> visual confirmation
+capture_screen() -> save state for debugging
+```
+
+## Performance Considerations
+
+### Efficient Element Location
+- Cache window trees when possible
+- Use specific selectors to avoid deep searches
+- Validate elements exist before complex operations
+
+### Timeout Management
+- Set appropriate timeouts for different operations
+- Longer timeouts for application startup
+- Shorter timeouts for element validation
+
+## Platform-Specific Considerations
+
+### Windows-Specific
+- Use PowerShell for advanced system operations
+- Handle Windows-specific element properties
+- Account for Windows accessibility API behavior
+
+### Cross-Platform Shell Commands
+```rust
+if cfg!(target_os = "windows") {
+    // Windows command
+} else if cfg!(target_os = "macos") {
+    // macOS command  
+} else {
+    // Linux command
+}
+```
+
+## File References
+- Core automation logic: [terminator/src/lib.rs](mdc:terminator/src/lib.rs)
+- Element implementation: [terminator/src/element.rs](mdc:terminator/src/element.rs)
+- Platform-specific code: [terminator/src/platforms/](mdc:terminator/src/platforms)
+
