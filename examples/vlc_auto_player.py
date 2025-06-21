@@ -14,8 +14,10 @@ To play a local video file:
 - If both are provided, YouTube takes priority.
 
 """
+
 import asyncio
 import terminator
+
 
 async def play_livestream_youtube_video(youtube_link):
     """
@@ -29,30 +31,35 @@ async def play_livestream_youtube_video(youtube_link):
     desktop = terminator.Desktop(log_level="error")
     try:
         print("Opening VLC media player...")
-        desktop.open_application("vlc.exe")
+        vlc_window = desktop.open_application(
+            "C:\\Program Files\\VideoLAN\VLC\\vlc.exe"
+        )
         await asyncio.sleep(2)
 
-        vlc_window = desktop.locator('window:VLC media player')
         print("Opening 'Open Network Stream' dialog...")
-        await vlc_window.press_key('{Ctrl}n')
+        vlc_window.press_key("{Ctrl}n")
         await asyncio.sleep(1.5)
 
-        open_media_win = desktop.locator('window:Open Media')
+        open_media_win = desktop.locator("window:Open Media")
         print("Locating and focusing Network Protocol ComboBox...")
-        combo = open_media_win.locator('Name:Network Protocol Down')
-        await combo.click()
+        combo = await open_media_win.locator("Name:Network Protocol Down").first()
+        combo.click()
         await asyncio.sleep(0.5)
         print(f"Pasting YouTube link: {youtube_link}")
-        edit_box = combo.locator('role:Edit')
-        await edit_box.click()
-        await edit_box.press_key('{Ctrl}a')
-        await edit_box.press_key('{Delete}')
-        await edit_box.type_text(youtube_link)
+        edit_box = (
+            await open_media_win.locator("Name:Network Protocol Down")
+            .locator("role:Edit")
+            .first()
+        )
+        edit_box.click()
+        edit_box.press_key("{Ctrl}a")
+        edit_box.press_key("{Delete}")
+        edit_box.type_text(youtube_link)
         await asyncio.sleep(0.5)
 
         print("Clicking Play button...")
-        play_button = open_media_win.locator('Name:Play Alt+P')
-        await play_button.click()
+        play_button = await open_media_win.locator("Name:Play Alt+P").first()
+        play_button.click()
         await asyncio.sleep(5)
         print("YouTube stream should now be playing in VLC!")
     except terminator.PlatformError as e:
@@ -61,7 +68,8 @@ async def play_livestream_youtube_video(youtube_link):
         print(f"An unexpected error occurred: {e}")
         print(f"Error details: {str(e)}")
 
-async def play_local_video(video_filename='my_video.mp4'):
+
+async def play_local_video(video_filename="my_video.mp4"):
     """
     Automate VLC to play local videos automatically.
     This script will:
@@ -77,27 +85,33 @@ async def play_local_video(video_filename='my_video.mp4'):
         desktop.open_application("vlc.exe")
         await asyncio.sleep(2)
 
-        vlc_window = desktop.locator('window:VLC media player')
+        vlc_window = desktop.locator("window:VLC media player")
         print("Opening Media menu...")
-        await vlc_window.press_key('{Alt}')
-        await vlc_window.press_key('m')
+        await vlc_window.press_key("{Alt}")
+        await vlc_window.press_key("m")
         print("Selecting Open File...")
         try:
-            open_file_btn = desktop.locator('Name:Open File...')
+            open_file_btn = desktop.locator("Name:Open File...")
             await open_file_btn.click()
         except Exception:
-            await vlc_window.press_key('{Ctrl}o')
+            await vlc_window.press_key("{Ctrl}o")
         await asyncio.sleep(1)
 
         print("Searching for specific video...")
-        file_dialog = desktop.locator('Window:Select one or more files to open')
+        file_dialog = desktop.locator("Window:Select one or more files to open")
         await asyncio.sleep(1)
-        file_name_edit_box = file_dialog.locator('role:ComboBox').locator('role:Edit')
+        file_name_edit_box = file_dialog.locator("role:ComboBox").locator("role:Edit")
         await file_name_edit_box.type_text(video_filename)
 
-        window_elements = await desktop.locator('Name:Select one or more files to open').explore()
+        window_elements = await desktop.locator(
+            "Name:Select one or more files to open"
+        ).explore()
         for child in window_elements.children:
-            if child.role == 'Button' and child.suggested_selector and child.name == 'Open':
+            if (
+                child.role == "Button"
+                and child.suggested_selector
+                and child.name == "Open"
+            ):
                 open_button = file_dialog.locator(child.suggested_selector)
                 await open_button.click()
                 print("Open button clicked!")
@@ -108,11 +122,11 @@ async def play_local_video(video_filename='my_video.mp4'):
         print("Waiting 2 seconds before pausing...")
         await asyncio.sleep(2)
         print("Pausing video...")
-        await vlc_window.press_key(' ')
+        await vlc_window.press_key(" ")
         print("Video paused. Waiting 2 seconds...")
         await asyncio.sleep(2)
         print("Resuming video...")
-        await vlc_window.press_key(' ')
+        await vlc_window.press_key(" ")
         print("Video resumed!")
     except terminator.PlatformError as e:
         print(f"Platform Error: {e}")
@@ -120,11 +134,13 @@ async def play_local_video(video_filename='my_video.mp4'):
         print(f"An unexpected error occurred: {e}")
         print(f"Error details: {str(e)}")
 
+
 async def main():
     import argparse
+
     parser = argparse.ArgumentParser(description="Automate VLC to play videos.")
-    parser.add_argument('--file', type=str, help='Local video file to play')
-    parser.add_argument('--youtube-link', type=str, help='YouTube link to play')
+    parser.add_argument("--file", type=str, help="Local video file to play")
+    parser.add_argument("--youtube-link", type=str, help="YouTube link to play")
     args = parser.parse_args()
 
     if args.youtube_link:
@@ -134,6 +150,7 @@ async def main():
     else:
         print("Please provide either --youtube-link or --file.\n")
         parser.print_help()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

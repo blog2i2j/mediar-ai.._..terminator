@@ -1,20 +1,18 @@
 mod desktop;
 mod element;
-mod locator;
-mod types;
 mod exceptions;
+mod locator;
+mod selector;
+mod types;
 
 // Main types first
 pub use desktop::Desktop;
 pub use element::Element;
 pub use locator::Locator;
+pub use selector::Selector;
 pub use types::{
-    Bounds,
-    Coordinates,
-    ClickResult,
-    CommandOutput,
-    ScreenshotResult,
-    UIElementAttributes,
+    Bounds, ClickResult, CommandOutput, Coordinates, Monitor, MonitorScreenshotPair,
+    PropertyLoadingMode, ScreenshotResult, TreeBuildConfig, UIElementAttributes, UINode,
 };
 
 // Error handling - see exceptions.rs for detailed architecture

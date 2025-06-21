@@ -1,0 +1,120 @@
+---
+description: When working with MCP
+globs: 
+alwaysApply: false
+---
+# Terminator MCP Agent Development Guide
+
+## Building the MCP Agent
+
+### Correct Build Command
+Always use the release build for MCP:
+```bash
+cargo build --release --bin terminator-mcp-agent
+```
+
+**Important**: Cursor IDE automatically runs the MCP server - you don't need to start/stop it manually. Just build with cargo and Cursor handles the rest.
+
+## MCP Tool Implementation Patterns
+
+### Parameter Handling
+- Use `#[tool(param)]` for struct parameters, NOT `#[tool(aggr)]`
+- Use `EmptyArgs` for tools that don't need parameters
+- Always use proper JsonSchema attributes with `#[schemars(description = "...")]`
+
+### Example Tool Structure
+```rust
+#[tool(description = "Tool description here")]
+async fn tool_name(
+    &self,
+    #[tool(param)] args: ToolArgs,
+) -> Result<CallToolResult, McpError> {
+    // Implementation
+}
+```
+
+
+### Avoid Complex SDK Wrapper Approaches
+Don't try to use UI automation for clipboard - use direct shell commands.
+
+## UI Automation Best Practices
+
+### Discovery-First Workflow
+1. **Get Applications**: `get_applications` to find target app and PID
+2. **Get UI Tree**: `get_window_tree(pid)` to understand structure
+3. **Analyze Elements**: Look for reliable selectors (ID > name > role)
+4. **Validate Before Action**: Use `validate_element` to check existence
+5. **Perform Action**: Click, type, close, etc.
+
+### Core MCP Tools Available
+- `get_applications` / `get_window_tree` - Discovery tools
+- `click_element` / `type_into_element` / `press_key` - Interaction tools  
+- `close_element` - Close windows, applications, dialogs
+- `validate_element` / `highlight_element` - Debugging tools
+- `set_clipboard` / `get_clipboard` - Data transfer tools
+- `capture_screen` - Visual debugging and OCR
+
+### Selector Chain Priority
+1. `#id` - Most reliable (use element ID)
+2. `name:"Element Name"` - Fallback for visible text
+3. `role:"Button"` - Last resort for element type
+
+### Error Handling
+- Always provide detailed error context with element info
+- Include selector_chain in error messages
+- Use proper timeout handling with `get_timeout()`
+
+## Testing and Debugging
+
+### Element Validation
+```rust
+// Always validate elements exist before interaction
+validate_element(&selector_chain) -> check exists/visible/enabled
+highlight_element(&selector_chain) -> visual confirmation
+```
+
+### Workflow Testing
+1. Test individual tools first
+2. Use `capture_screen` for visual debugging
+3. Check clipboard contents with `get_clipboard`
+4. Validate each step before proceeding
+
+## Data Extraction Patterns
+
+### OCR-Based Text Extraction
+```rust
+capture_screen() -> OCR for text extraction
+// Better than trying to parse UI tree for web content
+```
+
+### Structured Data Creation
+- Extract raw text first
+- Process into structured format (tables, JSON)
+- Use clipboard to transfer between applications
+
+## Common Anti-Patterns to Avoid
+
+### ❌ Don't Do
+- Complex clipboard implementations with UI automation
+- Guessing selectors without checking UI tree
+- Using `#[tool(aggr)]` for parameters
+- Manual data typing instead of extraction
+- Ignoring validation steps
+
+### ✅ Do Instead
+- Simple shell commands for system operations
+- UI tree analysis before element interaction
+- Proper parameter decoration with `#[tool(param)]`
+- OCR and automated data extraction
+- Validate elements before interaction
+- Take inspiration on Playwright MCP, Plawyright DX in general is great but make it more agentic ready
+
+## File References
+- Main server implementation: [terminator-mcp-agent/src/server.rs](mdc:terminator-mcp-agent/src/server.rs)
+- Utility types and helpers: [terminator-mcp-agent/src/utils.rs](mdc:terminator-mcp-agent/src/utils.rs)
+- Build configuration: [terminator-mcp-agent/Cargo.toml](mdc:terminator-mcp-agent/Cargo.toml)
+
+
+
+
+

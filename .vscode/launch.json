@@ -1,0 +1,70 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug Rust List Processes and Windows",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--example=list_processes_and_windows"
+                ],
+                "filter": {
+                    "name": "list_processes_and_windows",
+                    "kind": "example"
+                }
+            },
+            "args": [],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_LOG": "debug"
+            }
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug Rust Cursor Example",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--example=cursor_example"
+                ],
+                "filter": {
+                    "name": "cursor_example",
+                    "kind": "example"
+                }
+            },
+            "args": [],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_LOG": "debug"
+            }
+        },
+        {
+            "type": "node",
+            "request": "launch",
+            "name": "Debug cursor_example.js",
+            "program": "${workspaceFolder}/bindings/nodejs/cursor_example.js",
+            "cwd": "${workspaceFolder}/bindings/nodejs",
+            "console": "integratedTerminal",
+            "runtimeExecutable": "node",
+            "env": {
+                "NODE_ENV": "development"
+            }
+        },
+        {
+            "type": "node",
+            "request": "launch",
+            "name": "Debug test-tree.js",
+            "program": "${workspaceFolder}/bindings/nodejs/test-tree.js",
+            "cwd": "${workspaceFolder}/bindings/nodejs",
+            "console": "integratedTerminal",
+        }
+    ]
+}
