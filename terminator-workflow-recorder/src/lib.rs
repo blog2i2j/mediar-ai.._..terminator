@@ -6,16 +6,21 @@
 
 #![cfg_attr(not(target_os = "windows"), allow(unused))]
 
-pub mod events;
-pub mod recorder;
-pub mod error;
+mod error;
+mod events;
+mod recorder;
 
+pub use error::*;
 pub use events::{
-    Position, Rect, MouseButton, MouseEventType, KeyboardEvent, MouseEvent,
-    ClipboardAction, ClipboardEvent, TextSelectionEvent, SelectionMethod, DragDropEvent,
-    HotkeyEvent, WorkflowEvent, RecordedEvent, RecordedWorkflow, StructureChangeType,
-    UiStructureChangedEvent, UiPropertyChangedEvent, UiFocusChangedEvent, EventMetadata,
+    ApplicationSwitchEvent, ApplicationSwitchMethod, BrowserTabNavigationEvent, ButtonClickEvent,
+    ButtonInteractionType, ClipboardAction, ClipboardEvent, DragDropEvent, EventMetadata,
+    HotkeyEvent, KeyboardEvent, MouseButton, MouseEvent, MouseEventType, Position, RecordedEvent,
+    RecordedWorkflow, Rect, SelectionMethod, TabAction, TabNavigationMethod,
+    TextInputCompletedEvent, TextInputMethod, TextSelectionEvent, WorkflowEvent,
 };
 pub use recorder::*;
-pub use error::*;
 
+#[cfg(target_os = "windows")]
+pub mod structs {
+    pub use crate::recorder::windows::structs::*;
+}

@@ -2,24 +2,24 @@
 resolver = "2"
 members = [
     "terminator",
-    "terminator-workflow-recorder", 
-    "examples/terminator-rust-examples/button",   
-    "examples/terminator-rust-examples/server", 
-    "examples/terminator-rust-examples/win_automation",
+    "terminator-workflow-recorder",
     "bindings/python",
-    "bindings/nodejs"
+    "bindings/nodejs",
+    "terminator-mcp-agent",
+    "terminator-cli",
 ]
+
 
 # Shared metadata for workspace members
 [workspace.package]
-version = "0.3.5"   # From your original Cargo.toml
-edition = "2021"    # From your original Cargo.toml
+version = "0.6.8"
+edition = "2021"   # From your original Cargo.toml
+license-file = "LICENSE"
 
 # Centralized dependency definitions
-# Member crates can use these by specifying, e.g., `tokio = { workspace = true }`
 [workspace.dependencies]
 # Terminator Core library itself (for other members to depend on)
-terminator = { path = "./terminator" }
+terminator = { version = "0.6.8", path = "./terminator", package = "terminator-rs" }
 
 # Common dependencies from your original Cargo.toml
 serde = { version = "1.0.219", features = ["derive"] }
@@ -33,26 +33,20 @@ tokio = { version = "1.44.2", features = ["full"] }
 # OCR / Vision
 xcap = "0.6.0"
 image = "0.25.6"
-uni-ocr = { git = "https://github.com/mediar-ai/uniOCR", branch = "main" }
+uni-ocr = "0.1.5"
 tempfile = "3.10.1"
 async-trait = "0.1.88"
 base64 = "0.22.1"
 
 # macOS specific dependencies
-# These can be conditionally included in member crates' Cargo.toml like:
-# [target.'cfg(target_os = "macos")'.dependencies]
-# accessibility = { workspace = true }
-accessibility-sys = { git = "https://github.com/eiz/accessibility.git", branch = "master" }
-accessibility = { git = "https://github.com/eiz/accessibility.git", branch = "master" }
+accessibility-sys = "0.2.0"
+accessibility = "0.2.0"
 objc = "0.2.7"
 objc-foundation = "0.1.1"
 core-foundation = { version = "0.10.0" }
 core-graphics = { version = "0.24.0", features = ["highsierra"] }
 
 # Windows specific dependencies
-# These can be conditionally included in member crates' Cargo.toml like:
-# [target.'cfg(target_os = "windows")'.dependencies]
-# uiautomation = { workspace = true }
 uiautomation = { version = "0.18.0" }
 sysinfo = "0.34.2"
 

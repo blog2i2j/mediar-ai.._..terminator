@@ -1,0 +1,16 @@
+[package]
+name = "terminator-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "terminator"
+path = "src/main.rs"
+
+[[bin]]
+name = "cargo-terminator"
+path = "src/bin/cargo-terminator.rs"
+
+[dependencies]
+serde_json = "1.0.140"
+clap = { version = "4.4", features = ["derive"] }
