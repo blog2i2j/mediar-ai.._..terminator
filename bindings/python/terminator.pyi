@@ -108,13 +108,6 @@ class Desktop:
         Returns:
             Locator: A locator for finding elements.
         """
-    async def capture_screen(self) -> ScreenshotResult:
-        r"""
-        (async) Capture a screenshot of the primary monitor.
-        
-        Returns:
-            ScreenshotResult: The screenshot data.
-        """
     async def run_command(self, windows_command:typing.Optional[builtins.str]=None, unix_command:typing.Optional[builtins.str]=None) -> CommandOutput:
         r"""
         (async) Run a shell command.
@@ -125,23 +118,6 @@ class Desktop:
         
         Returns:
             CommandOutput: The command output.
-        """
-    async def get_active_monitor_name(self) -> str:
-        r"""
-        (async) Get the name of the currently active monitor.
-        
-        Returns:
-            str: The name of the active monitor.
-        """
-    async def capture_monitor_by_name(self, name:builtins.str) -> ScreenshotResult:
-        r"""
-        (async) Capture a screenshot of a specific monitor.
-        
-        Args:
-            name (str): The name of the monitor to capture.
-        
-        Returns:
-            ScreenshotResult: The screenshot data.
         """
     async def ocr_image_path(self, image_path:builtins.str) -> str:
         r"""
@@ -162,17 +138,6 @@ class Desktop:
         
         Returns:
             str: The extracted text.
-        """
-    async def find_window_by_criteria(self, title_contains:typing.Optional[builtins.str]=None, timeout_ms:typing.Optional[builtins.int]=None) -> UIElement:
-        r"""
-        (async) Find a window by criteria.
-        
-        Args:
-            title_contains (Optional[str]): Text that should be in the window title.
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            UIElement: The found window element.
         """
     async def get_current_browser_window(self) -> UIElement:
         r"""
@@ -195,13 +160,13 @@ class Desktop:
         Returns:
             UIElement: The current application element.
         """
-    def open_url(self, url:builtins.str, browser:typing.Optional[builtins.str]=None) -> None:
+    def open_url(self, url:builtins.str, browser:typing.Optional[builtins.str]=None) -> UIElement:
         r"""
         Open a URL in a browser.
         
         Args:
             url (str): The URL to open.
-            browser (Optional[str]): The browser to use.
+            browser (Optional[str]): The browser to use. Can be "Default", "Chrome", "Firefox", "Edge", "Brave", "Opera", "Vivaldi", "Arc", or a custom browser path.
         """
     def open_file(self, file_path:builtins.str) -> None:
         r"""
@@ -223,6 +188,76 @@ class Desktop:
         
         Returns:
             UIElement: The focused element.
+        """
+    def get_window_tree(self, pid:builtins.int, title:typing.Optional[builtins.str]=None, config:typing.Optional[TreeBuildConfig]=None) -> UINode:
+        r"""
+        Get the UI tree for a window identified by process ID and optional title.
+        
+        Args:
+            pid (int): Process ID of the target application.
+            title (Optional[str]): Optional window title filter.
+            config (Optional[TreeBuildConfig]): Optional configuration for tree building.
+        
+        Returns:
+            UINode: Complete UI tree starting from the identified window.
+        """
+    async def list_monitors(self) -> typing.List[Monitor]:
+        r"""
+        (async) List all available monitors/displays.
+        
+        Returns:
+            List[Monitor]: List of monitor information.
+        """
+    async def get_primary_monitor(self) -> Monitor:
+        r"""
+        (async) Get the primary monitor.
+        
+        Returns:
+            Monitor: Primary monitor information.
+        """
+    async def get_active_monitor(self) -> Monitor:
+        r"""
+        (async) Get the monitor containing the currently focused window.
+        
+        Returns:
+            Monitor: Active monitor information.
+        """
+    async def get_monitor_by_id(self, id:builtins.str) -> Monitor:
+        r"""
+        (async) Get a monitor by its ID.
+        
+        Args:
+            id (str): The monitor ID to find.
+        
+        Returns:
+            Monitor: Monitor information.
+        """
+    async def get_monitor_by_name(self, name:builtins.str) -> Monitor:
+        r"""
+        (async) Get a monitor by its name.
+        
+        Args:
+            name (str): The monitor name to find.
+        
+        Returns:
+            Monitor: Monitor information.
+        """
+    async def capture_monitor(self, monitor:Monitor) -> ScreenshotResult:
+        r"""
+        (async) Capture a screenshot of a specific monitor.
+        
+        Args:
+            monitor (Monitor): The monitor to capture.
+        
+        Returns:
+            ScreenshotResult: The screenshot data.
+        """
+    async def capture_all_monitors(self) -> typing.List[Tuple[Monitor, ScreenshotResult]]:
+        r"""
+        (async) Capture screenshots of all monitors.
+        
+        Returns:
+            List[Tuple[Monitor, ScreenshotResult]]: List of monitor and screenshot pairs.
         """
 
 class ExploreResponse:
@@ -303,112 +338,6 @@ class Locator:
         Returns:
             Locator: A new locator with the chained selector.
         """
-    async def click(self, timeout_ms:typing.Optional[builtins.int]=None) -> ClickResult:
-        r"""
-        (async) Click on the first matching element.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            ClickResult: Result of the click operation.
-        """
-    async def type_text(self, text:builtins.str, use_clipboard:typing.Optional[builtins.bool]=None, timeout_ms:typing.Optional[builtins.int]=None) -> None:
-        r"""
-        (async) Type text into the first matching element.
-        
-        Args:
-            text (str): The text to type.
-            use_clipboard (Optional[bool]): Whether to use clipboard for pasting.
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            None
-        """
-    async def press_key(self, key:builtins.str, timeout_ms:typing.Optional[builtins.int]=None) -> None:
-        r"""
-        (async) Press a key on the first matching element.
-        
-        Args:
-            key (str): The key to press.
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            None
-        """
-    async def text(self, max_depth:typing.Optional[builtins.int]=None, timeout_ms:typing.Optional[builtins.int]=None) -> str:
-        r"""
-        (async) Get text from the first matching element.
-        
-        Args:
-            max_depth (Optional[int]): Maximum depth to search for text.
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            str: The element's text content.
-        """
-    async def attributes(self, timeout_ms:typing.Optional[builtins.int]=None) -> UIElementAttributes:
-        r"""
-        (async) Get attributes from the first matching element.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            UIElementAttributes: The element's attributes.
-        """
-    async def bounds(self, timeout_ms:typing.Optional[builtins.int]=None) -> Bounds:
-        r"""
-        (async) Get bounds from the first matching element.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            Bounds: The element's bounds.
-        """
-    async def is_visible(self, timeout_ms:typing.Optional[builtins.int]=None) -> bool:
-        r"""
-        (async) Check if the element is visible.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            bool: True if the element is visible.
-        """
-    async def expect_enabled(self, timeout_ms:typing.Optional[builtins.int]=None) -> UIElement:
-        r"""
-        (async) Wait for the element to be enabled.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            UIElement: The enabled element.
-        """
-    async def expect_visible(self, timeout_ms:typing.Optional[builtins.int]=None) -> UIElement:
-        r"""
-        (async) Wait for the element to be visible.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            UIElement: The visible element.
-        """
-    async def expect_text_equals(self, expected_text:builtins.str, max_depth:typing.Optional[builtins.int]=None, timeout_ms:typing.Optional[builtins.int]=None) -> UIElement:
-        r"""
-        (async) Wait for the element's text to equal the expected text.
-        
-        Args:
-            expected_text (str): The expected text.
-            max_depth (Optional[int]): Maximum depth to search for text.
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            UIElement: The element with matching text.
-        """
     def within(self, element:UIElement) -> Locator:
         r"""
         Set the root element for this locator.
@@ -419,260 +348,29 @@ class Locator:
         Returns:
             Locator: A new locator with the specified root element.
         """
-    async def double_click(self, timeout_ms:typing.Optional[builtins.int]=None) -> ClickResult:
-        r"""
-        (async) Double click on the first matching element.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            ClickResult: Result of the click operation.
-        """
-    async def right_click(self, timeout_ms:typing.Optional[builtins.int]=None) -> None:
-        r"""
-        (async) Right click on the first matching element.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            None
-        """
-    async def hover(self, timeout_ms:typing.Optional[builtins.int]=None) -> None:
-        r"""
-        (async) Hover over the first matching element.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            None
-        """
-    async def explore(self, timeout_ms:typing.Optional[builtins.int]=None) -> ExploreResponse:
-        r"""
-        (async) Explore the first matching element and its direct children.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            ExploreResponse: Details about the element and its children.
-        """
-    async def id(self, timeout_ms:typing.Optional[builtins.int]=None) -> typing.Optional[str]:
-        r"""
-        (async) Get the id of the first matching element.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            Optional[str]: The element's id, or None if not present.
-        """
-    async def role(self, timeout_ms:typing.Optional[builtins.int]=None) -> str:
-        r"""
-        (async) Get the role of the first matching element.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            str: The element's role.
-        """
-    async def children(self, timeout_ms:typing.Optional[builtins.int]=None) -> typing.List[UIElement]:
-        r"""
-        (async) Get the children of the first matching element.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            List[UIElement]: The element's children.
-        """
-    async def parent(self, timeout_ms:typing.Optional[builtins.int]=None) -> typing.Optional[UIElement]:
-        r"""
-        (async) Get the parent of the first matching element.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            Optional[UIElement]: The element's parent, or None if not present.
-        """
-    async def set_value(self, value:builtins.str, timeout_ms:typing.Optional[builtins.int]=None) -> None:
-        r"""
-        (async) Set value of the first matching element.
-        
-        Args:
-            value (str): The value to set.
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            None
-        """
-    async def is_focused(self, timeout_ms:typing.Optional[builtins.int]=None) -> bool:
-        r"""
-        (async) Check if the first matching element is focused.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            bool: True if the element is focused.
-        """
-    async def perform_action(self, action:builtins.str, timeout_ms:typing.Optional[builtins.int]=None) -> None:
-        r"""
-        (async) Perform a named action on the first matching element.
-        
-        Args:
-            action (str): The action name.
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            None
-        """
-    async def scroll(self, direction:builtins.str, amount:builtins.float, timeout_ms:typing.Optional[builtins.int]=None) -> None:
-        r"""
-        (async) Scroll the first matching element in a given direction.
-        
-        Args:
-            direction (str): The scroll direction (e.g., "up", "down").
-            amount (float): The amount to scroll.
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            None
-        """
-    async def activate_window(self, timeout_ms:typing.Optional[builtins.int]=None) -> None:
-        r"""
-        (async) Activate the window containing the first matching element.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            None
-        """
-    async def name(self, timeout_ms:typing.Optional[builtins.int]=None) -> typing.Optional[str]:
-        r"""
-        (async) Get the name of the first matching element.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            Optional[str]: The element's name, or None if not present.
-        """
-    async def is_keyboard_focusable(self, timeout_ms:typing.Optional[builtins.int]=None) -> bool:
-        r"""
-        (async) Check if the first matching element is keyboard focusable.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            bool: True if the element is keyboard focusable.
-        """
-    async def mouse_drag(self, start_x:builtins.float, start_y:builtins.float, end_x:builtins.float, end_y:builtins.float, timeout_ms:typing.Optional[builtins.int]=None) -> None:
-        r"""
-        (async) Drag mouse from start to end coordinates on the first matching element.
-        
-        Args:
-            start_x (float): Starting x coordinate.
-            start_y (float): Starting y coordinate.
-            end_x (float): Ending x coordinate.
-            end_y (float): Ending y coordinate.
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            None
-        """
-    async def mouse_click_and_hold(self, x:builtins.float, y:builtins.float, timeout_ms:typing.Optional[builtins.int]=None) -> None:
-        r"""
-        (async) Press and hold mouse at (x, y) on the first matching element.
-        
-        Args:
-            x (float): X coordinate.
-            y (float): Y coordinate.
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            None
-        """
-    async def mouse_move(self, x:builtins.float, y:builtins.float, timeout_ms:typing.Optional[builtins.int]=None) -> None:
-        r"""
-        (async) Move mouse to (x, y) on the first matching element.
-        
-        Args:
-            x (float): X coordinate.
-            y (float): Y coordinate.
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            None
-        """
-    async def mouse_release(self, timeout_ms:typing.Optional[builtins.int]=None) -> None:
-        r"""
-        (async) Release mouse button on the first matching element.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            None
-        """
-    async def application(self, timeout_ms:typing.Optional[builtins.int]=None) -> typing.Optional[UIElement]:
-        r"""
-        (async) Get the containing application element of the first matching element.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            Optional[UIElement]: The application element, or None if not present.
-        """
-    async def window(self, timeout_ms:typing.Optional[builtins.int]=None) -> typing.Optional[UIElement]:
-        r"""
-        (async) Get the containing window element of the first matching element.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            Optional[UIElement]: The window element, or None if not present.
-        """
-    async def process_id(self, timeout_ms:typing.Optional[builtins.int]=None) -> int:
-        r"""
-        (async) Get the process ID of the application containing the first matching element.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            int: The process ID of the application.
-        """
-    async def highlight(self, color:typing.Optional[builtins.int]=None, duration_ms:typing.Optional[builtins.int]=None, timeout_ms:typing.Optional[builtins.int]=None) -> None:
-        r"""
-        (async) Highlights the first matching element with a colored border.
-        
-        Args:
-            color (Optional[int]): BGR color code (32-bit integer). Default: 0x0000FF (red)
-            duration_ms (Optional[int]): Duration in milliseconds.
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            None
-        """
-    async def capture(self, timeout_ms:typing.Optional[builtins.int]=None) -> ScreenshotResult:
-        r"""
-        (async) Capture a screenshot of the first matching element.
-        
-        Args:
-            timeout_ms (Optional[int]): Timeout in milliseconds.
-        
-        Returns:
-            ScreenshotResult: The screenshot result containing the image data.
-        """
+
+class Monitor:
+    r"""
+    Monitor/display information.
+    """
+    id: builtins.str
+    name: builtins.str
+    is_primary: builtins.bool
+    width: builtins.int
+    height: builtins.int
+    x: builtins.int
+    y: builtins.int
+    scale_factor: builtins.float
+    def __repr__(self) -> builtins.str: ...
+    def __str__(self) -> builtins.str: ...
+
+class PropertyLoadingMode:
+    r"""
+    Property loading strategy for tree building
+    """
+    mode: builtins.str
+    def __repr__(self) -> builtins.str: ...
+    def __str__(self) -> builtins.str: ...
 
 class ScreenshotResult:
     r"""
@@ -681,6 +379,18 @@ class ScreenshotResult:
     width: builtins.int
     height: builtins.int
     image_data: builtins.list[builtins.int]
+    monitor: typing.Optional[Monitor]
+    def __repr__(self) -> builtins.str: ...
+    def __str__(self) -> builtins.str: ...
+
+class TreeBuildConfig:
+    r"""
+    Configuration for tree building performance and completeness
+    """
+    property_mode: PropertyLoadingMode
+    timeout_per_operation_ms: typing.Optional[builtins.int]
+    yield_every_n_elements: typing.Optional[builtins.int]
+    batch_size: typing.Optional[builtins.int]
     def __repr__(self) -> builtins.str: ...
     def __str__(self) -> builtins.str: ...
 
@@ -935,13 +645,6 @@ class UIElement:
         Returns:
             Locator: A new locator for finding elements.
         """
-    def explore(self) -> ExploreResponse:
-        r"""
-        Explore this element and its direct children.
-        
-        Returns:
-            ExploreResponse: Details about the element and its children.
-        """
     def process_id(self) -> builtins.int:
         r"""
         Get the process ID of the application containing this element.
@@ -967,6 +670,31 @@ class UIElement:
         Returns:
             ScreenshotResult: The screenshot data containing image data and dimensions.
         """
+    def set_transparency(self, percentage:builtins.int) -> None:
+        r"""
+        Sets the transparency of the window.
+        
+        Args:
+            percentage (int): The transparency percentage from 0 (completely transparent) to 100 (completely opaque).
+        
+        Returns:
+            None
+        """
+    def close(self) -> None:
+        r"""
+        Close the element if it's closable (like windows, applications).
+        Does nothing for non-closable elements (like buttons, text, etc.).
+        
+        Returns:
+            None
+        """
+    def monitor(self) -> Monitor:
+        r"""
+        Get the monitor containing this element.
+        
+        Returns:
+            Monitor: The monitor information for the display containing this element.
+        """
 
 class UIElementAttributes:
     r"""
@@ -979,6 +707,17 @@ class UIElementAttributes:
     description: typing.Optional[builtins.str]
     properties: builtins.dict[builtins.str, typing.Optional[builtins.str]]
     is_keyboard_focusable: typing.Optional[builtins.bool]
+    bounds: typing.Optional[Bounds]
+    def __repr__(self) -> builtins.str: ...
+    def __str__(self) -> builtins.str: ...
+
+class UINode:
+    r"""
+    UI Node representing a tree structure of UI elements
+    """
+    id: typing.Optional[builtins.str]
+    attributes: UIElementAttributes
+    children: builtins.list[UINode]
     def __repr__(self) -> builtins.str: ...
     def __str__(self) -> builtins.str: ...
 

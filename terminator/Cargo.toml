@@ -1,7 +1,16 @@
 [package]
-name = "terminator"
+name = "terminator-rs"
 version = { workspace = true }
-edition = "2024"
+edition = "2021"
+description = "A Playwright-style SDK for automating desktop GUI applications"
+authors = ["Mediar AI"]
+repository = "https://github.com/mediar-ai/terminator"
+homepage = "https://github.com/mediar-ai/terminator"
+documentation = "https://docs.rs/terminator"
+readme = "../README.md"
+keywords = ["automation", "gui", "desktop", "accessibility", "testing"]
+categories = ["accessibility", "api-bindings", "development-tools::testing"]
+license-file = { workspace = true }
 
 [dependencies]
 serde = { workspace = true }
@@ -16,22 +25,31 @@ tokio = { workspace = true }
 xcap = { workspace = true }
 image = { workspace = true }
 uni-ocr = { workspace = true }
-tempfile = { workspace = true }
 async-trait = { workspace = true }
-base64 = { workspace = true }
+futures = "0.3"
 
 [lib]
 name = "terminator"
 path = "src/lib.rs"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-accessibility-sys = { git = "https://github.com/eiz/accessibility.git", branch = "master" }
-accessibility = { git = "https://github.com/eiz/accessibility.git", branch = "master" }
-objc = "0.2.7"
-objc-foundation = "0.1.1"
+[target.'cfg(target_os = "linux")'.dependencies]
+atspi = { version = "0.26.3", features = [
+    "tokio",
+    "proxies-tokio",
+    "zbus",
+    "connection",
+] }
+zbus = { version = "5.5", default-features = false }
+atspi-common = { version = "0.10.1", default-features = false }
+atspi-proxies = { version = "0.10.2", default-features = false }
 
-core-foundation = "0.10.1"
-core-graphics = { version = "0.24.0", features = ["highsierra"] }
+[target.'cfg(target_os = "macos")'.dependencies]
+accessibility-sys = { workspace = true }
+accessibility = { workspace = true }
+objc = { workspace = true }
+objc-foundation = { workspace = true }
+core-foundation = { workspace = true }
+core-graphics = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61.1", features = [
@@ -39,14 +57,22 @@ windows = { version = "0.61.1", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Com",
     "Win32_UI_Shell",
-    "Win32_Security"
+    "Win32_Security",
+    "Win32_UI_WindowsAndMessaging",
 ] }
-uiautomation = { version = "0.19.0" }
-sysinfo = "0.34.2"
 
-[[example]]
-name = "server"
-path = "../examples/terminator-rust-examples/server/src/main.rs"
+# uiautomation = { version = "0.21.2", features = [
+#     "clipboard",
+#     "input",
+#     "process",
+# ] }
+# https://github.com/mediar-ai/uiautomation-rs 
+uiautomation = { git = "https://github.com/mediar-ai/uiautomation-rs", branch = "main", features = [
+    "clipboard",
+    "input",
+    "process",
+] }
+sysinfo = "0.34.2"
 
 [[example]]
 name = "benchmark_example"
@@ -58,13 +84,8 @@ axum = "0.8.3"
 tower-http = { version = "0.6.2", features = ["cors", "limit"] }
 reqwest = { version = "0.12.5", features = ["json", "blocking"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-
-[[bench]]
-name = "element_tree_benchmarks"
-harness = false
-
-[[bench]]
-name = "tree_performance_benchmarks"
-harness = false
-
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+warp = "0.3.7"
+tiny_http = "0.12.0"
